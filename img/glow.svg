@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#1a1a2e"/>
+      <stop offset="100%" style="stop-color:#0a0a14"/>
+    </linearGradient>
+    <linearGradient id="rust" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#f74c00"/>
+      <stop offset="100%" style="stop-color:#b7410e"/>
+    </linearGradient>
+    <radialGradient id="imgGlow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" style="stop-color:#f74c00;stop-opacity:0.3"/>
+      <stop offset="100%" style="stop-color:#f74c00;stop-opacity:0"/>
+    </radialGradient>
+  </defs>
+  <style>
+    @keyframes shimmer { 0%,100% { opacity: 0.5; } 50% { opacity: 1; } }
+    @keyframes scan { 0% { y: 65; } 100% { y: 150; } }
+    .pixel { animation: shimmer 2s ease-in-out infinite; }
+    .scanline { animation: scan 3s ease-in-out infinite alternate; }
+  </style>
+  <circle cx="128" cy="128" r="120" fill="url(#bg)" stroke="url(#rust)" stroke-width="3"/>
+  <!-- Glow effect behind image -->
+  <circle cx="128" cy="105" r="55" fill="url(#imgGlow)"/>
+  <!-- Image frame -->
+  <rect x="68" y="58" width="120" height="90" rx="4" fill="#0d0d0d" stroke="#f74c00" stroke-width="1.5"/>
+  <!-- Landscape: mountains -->
+  <polygon points="68,148 98,85 118,110 138,78 158,105 188,148" fill="none" stroke="#4c4" stroke-width="1.5" opacity="0.6"/>
+  <!-- Sun -->
+  <circle class="pixel" cx="155" cy="78" r="10" fill="#f74c00" opacity="0.7"/>
+  <!-- Pixel grid overlay -->
+  <g opacity="0.15">
+    <line x1="68" y1="80" x2="188" y2="80" stroke="#f74c00" stroke-width="0.3"/>
+    <line x1="68" y1="100" x2="188" y2="100" stroke="#f74c00" stroke-width="0.3"/>
+    <line x1="68" y1="120" x2="188" y2="120" stroke="#f74c00" stroke-width="0.3"/>
+    <line x1="88" y1="58" x2="88" y2="148" stroke="#f74c00" stroke-width="0.3"/>
+    <line x1="108" y1="58" x2="108" y2="148" stroke="#f74c00" stroke-width="0.3"/>
+    <line x1="128" y1="58" x2="128" y2="148" stroke="#f74c00" stroke-width="0.3"/>
+    <line x1="148" y1="58" x2="148" y2="148" stroke="#f74c00" stroke-width="0.3"/>
+    <line x1="168" y1="58" x2="168" y2="148" stroke="#f74c00" stroke-width="0.3"/>
+  </g>
+  <!-- Protocol labels -->
+  <text x="80" y="168" font-family="monospace" font-size="7" fill="#51afef" opacity="0.5">kitty</text>
+  <text x="115" y="168" font-family="monospace" font-size="7" fill="#4c4" opacity="0.5">sixel</text>
+  <text x="150" y="168" font-family="monospace" font-size="7" fill="#e2b714" opacity="0.5">w3m</text>
+  <!-- Scan line -->
+  <rect class="scanline" x="68" y="65" width="120" height="1" fill="#f74c00" opacity="0.3"/>
+  <text x="128" y="203" font-family="monospace" font-size="24" font-weight="bold" fill="url(#rust)" text-anchor="middle" letter-spacing="3">glow</text>
+  <text x="128" y="221" font-family="monospace" font-size="8" fill="#888" text-anchor="middle">terminal image display</text>
+</svg>
