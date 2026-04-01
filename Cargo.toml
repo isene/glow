@@ -1,0 +1,12 @@
+[package]
+name = "glow"
+version = "0.1.0"
+edition = "2024"
+authors = ["Geir Isene <g@isene.com>"]
+description = "Rust terminal image display (kitty/sixel/w3m). Feature clone of termpix."
+license = "Unlicense"
+repository = "https://github.com/isene/glow"
+
+[dependencies]
+base64 = "0.22"
+libc = "0.2"
