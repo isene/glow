@@ -122,7 +122,7 @@ impl Display {
                 .arg(format!("{}[0]", image_path))
                 .arg("-auto-orient")
                 .arg("-resize")
-                .arg(format!("{}x{}\\>", pixel_w, pixel_h))
+                .arg(format!("{}x{}>", pixel_w, pixel_h))
                 .arg("PNG:-")
                 .output();
 
