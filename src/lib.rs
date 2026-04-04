@@ -296,6 +296,7 @@ fn chafa_display(image_path: &str, x: u16, y: u16, max_width: u16, max_height: u
         .args([
             "--size", &format!("{}x{}", max_width, max_height),
             "--animate", "off",
+            "--format", "symbols",  // Force text symbols, not sixel/kitty
             "--color-space", "din99d",
         ])
         .arg(image_path)
