@@ -9,6 +9,9 @@ repository = "https://github.com/isene/glow"
 keywords = ["terminal", "image", "kitty", "sixel", "tui"]
 categories = ["command-line-interface", "multimedia::images"]
 
+[lib]
+name = "glow"
+
 [dependencies]
 base64 = "0.22"
 libc = "0.2"
