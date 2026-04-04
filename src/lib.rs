@@ -22,6 +22,7 @@ pub enum Protocol {
     Kitty,
     Sixel,
     W3m,
+    Chafa,
 }
 
 pub struct Display {
@@ -31,8 +32,27 @@ pub struct Display {
 }
 
 impl Display {
+    /// Auto-detect the best protocol
     pub fn new() -> Self {
         let protocol = detect_protocol();
+        Self {
+            protocol,
+            active_ids: Vec::new(),
+            image_cache: HashMap::new(),
+        }
+    }
+
+    /// Force a specific display mode ("auto", "ascii", "off", "kitty", "sixel")
+    pub fn with_mode(mode: &str) -> Self {
+        let protocol = match mode {
+            "ascii" | "chafa" => {
+                if command_exists("chafa") { Some(Protocol::Chafa) } else { None }
+            }
+            "kitty" => Some(Protocol::Kitty),
+            "sixel" => Some(Protocol::Sixel),
+            "off" | "none" => None,
+            _ => detect_protocol(), // "auto"
+        };
         Self {
             protocol,
             active_ids: Vec::new(),
@@ -64,6 +84,7 @@ impl Display {
             Protocol::Kitty => self.kitty_display(image_path, x, y, max_width, max_height),
             Protocol::Sixel => sixel_display(image_path, x, y, max_width, max_height),
             Protocol::W3m => w3m_display(image_path, x, y, max_width, max_height),
+            Protocol::Chafa => chafa_display(image_path, x, y, max_width, max_height),
         }
     }
 
@@ -84,6 +105,9 @@ impl Display {
             }
             Some(Protocol::W3m) => {
                 w3m_clear(x, y, width, height, term_width, term_height);
+            }
+            Some(Protocol::Chafa) => {
+                // Chafa is text-based, cleared by terminal redraw
             }
             None => {}
         }
@@ -265,6 +289,31 @@ fn w3m_clear(x: u16, y: u16, width: u16, height: u16, term_width: u16, term_heig
     }
 }
 
+// --- Chafa ASCII art ---
+
+fn chafa_display(image_path: &str, x: u16, y: u16, max_width: u16, max_height: u16) -> bool {
+    let output = Command::new("chafa")
+        .args([
+            "--size", &format!("{}x{}", max_width, max_height),
+            "--animate", "off",
+            "--color-space", "din99d",
+        ])
+        .arg(image_path)
+        .output();
+    match output {
+        Ok(o) if o.status.success() => {
+            let text = String::from_utf8_lossy(&o.stdout);
+            for (i, line) in text.lines().enumerate() {
+                if i >= max_height as usize { break; }
+                print!("\x1b[{};{}H{}", y + i as u16, x, line);
+            }
+            io::stdout().flush().ok();
+            true
+        }
+        _ => false,
+    }
+}
+
 // --- Protocol detection ---
 
 fn detect_protocol() -> Option<Protocol> {
@@ -292,6 +341,11 @@ fn detect_protocol() -> Option<Protocol> {
         if command_exists("xwininfo") && command_exists("xdotool") && command_exists("identify") {
             return Some(Protocol::W3m);
         }
+    }
+
+    // Chafa ASCII art fallback (works in any terminal)
+    if command_exists("chafa") {
+        return Some(Protocol::Chafa);
     }
 
     None
