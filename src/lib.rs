@@ -28,7 +28,7 @@ pub enum Protocol {
 pub struct Display {
     protocol: Option<Protocol>,
     active_ids: Vec<u32>,
-    image_cache: HashMap<String, u32>,
+    image_cache: HashMap<String, (u32, u16)>,  // (image_id, natural_rows)
 }
 
 impl Display {
@@ -122,17 +122,16 @@ impl Display {
         }
 
         let pixel_w = max_width as u32 * cell_w as u32;
-        let pixel_h = max_height as u32 * cell_h as u32;
 
-        // Cache key includes dimensions and mtime
+        // Cache by path + width + mtime (NOT height, so shrinking reuses cached data)
         let mtime = std::fs::metadata(image_path)
             .and_then(|m| m.modified())
             .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs())
             .unwrap_or(0);
-        let cache_key = format!("{}:{}x{}:{}", image_path, pixel_w, pixel_h, mtime);
+        let cache_key = format!("{}:{}:{}", image_path, pixel_w, mtime);
 
-        let image_id = if let Some(&id) = self.image_cache.get(&cache_key) {
-            id
+        let (image_id, natural_rows) = if let Some(&cached) = self.image_cache.get(&cache_key) {
+            cached
         } else {
             // Generate new ID
             let id = (std::time::SystemTime::now()
@@ -141,12 +140,12 @@ impl Display {
                 .as_millis() % 4294967295) as u32;
             let id = if id == 0 { 1 } else { id };
 
-            // Scale image with ImageMagick and get PNG data
+            // Scale by width only (ImageMagick preserves aspect ratio)
             let output = Command::new("convert")
                 .arg(format!("{}[0]", image_path))
                 .arg("-auto-orient")
                 .arg("-resize")
-                .arg(format!("{}x{}>", pixel_w, pixel_h))
+                .arg(format!("{}>", pixel_w))
                 .arg("PNG:-")
                 .output();
 
@@ -154,6 +153,10 @@ impl Display {
                 Ok(o) if !o.stdout.is_empty() => o.stdout,
                 _ => return false,
             };
+
+            // Get actual image height from PNG header to compute natural row count
+            let img_pixel_h = png_height(&png_data).unwrap_or(pixel_w);
+            let nat_rows = ((img_pixel_h as f64) / (cell_h as f64)).ceil() as u16;
 
             // Encode and transmit in chunks
             let encoded = base64::engine::general_purpose::STANDARD.encode(&png_data);
@@ -171,13 +174,20 @@ impl Display {
                 }
             }
             io::stdout().flush().ok();
-            self.image_cache.insert(cache_key, id);
-            id
+            self.image_cache.insert(cache_key, (id, nat_rows));
+            (id, nat_rows)
         };
 
-        // Position and place
+        // Delete previous placement, then place at new position.
+        print!("\x1b_Ga=d,d=i,i={}\x1b\\", image_id);
         print!("\x1b[{};{}H", y, x);
-        print!("\x1b_Ga=p,i={},C=1\x1b\\", image_id);
+        if max_height < natural_rows && natural_rows > 0 {
+            // Shrinking: scale both dimensions proportionally to maintain aspect ratio
+            let scale_cols = (max_width as u32 * max_height as u32 / natural_rows as u32).max(1) as u16;
+            print!("\x1b_Ga=p,i={},c={},r={},C=1\x1b\\", image_id, scale_cols, max_height);
+        } else {
+            print!("\x1b_Ga=p,i={},C=1\x1b\\", image_id);
+        }
         io::stdout().flush().ok();
 
         if !self.active_ids.contains(&image_id) {
@@ -360,6 +370,15 @@ fn command_exists(cmd: &str) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// Extract height from PNG IHDR chunk (bytes 20-23, big-endian u32)
+fn png_height(data: &[u8]) -> Option<u32> {
+    if data.len() >= 24 && &data[0..4] == b"\x89PNG" {
+        Some(u32::from_be_bytes([data[20], data[21], data[22], data[23]]))
+    } else {
+        None
+    }
 }
 
 fn get_cell_size() -> (u16, u16) {
