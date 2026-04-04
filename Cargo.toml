@@ -1,11 +1,13 @@
 [package]
-name = "glow"
+name = "fe2o3-glow"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 authors = ["Geir Isene <g@isene.com>"]
-description = "Rust terminal image display (kitty/sixel/w3m). Feature clone of termpix."
+description = "Terminal image display via kitty/sixel/w3m protocols. Feature clone of termpix."
 license = "Unlicense"
 repository = "https://github.com/isene/glow"
+keywords = ["terminal", "image", "kitty", "sixel", "tui"]
+categories = ["command-line-interface", "multimedia::images"]
 
 [dependencies]
 base64 = "0.22"
