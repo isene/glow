@@ -25,10 +25,51 @@ pub enum Protocol {
     Chafa,
 }
 
+/// Pre-converted PNG data cache, shareable across threads.
+pub type PngCache = std::sync::Arc<std::sync::Mutex<HashMap<String, Vec<u8>>>>;
+
+pub fn new_png_cache() -> PngCache {
+    std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Pre-convert images to PNG in background. Call from a spawned thread.
+pub fn preconvert_images(paths: &[String], pixel_width: u32, cache: &PngCache) {
+    for path_str in paths {
+        let mtime = std::fs::metadata(path_str)
+            .and_then(|m| m.modified())
+            .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs())
+            .unwrap_or(0);
+        let key = format!("{}:{}:{}", path_str, pixel_width, mtime);
+
+        // Skip if already cached
+        if let Ok(c) = cache.lock() {
+            if c.contains_key(&key) { continue; }
+        }
+
+        let output = Command::new("convert")
+            .arg(format!("{}[0]", path_str))
+            .arg("-auto-orient")
+            .arg("-resize")
+            .arg(format!("{}>", pixel_width))
+            .arg("PNG:-")
+            .output();
+
+        if let Ok(o) = output {
+            if !o.stdout.is_empty() {
+                if let Ok(mut c) = cache.lock() {
+                    if c.len() > 32 { c.clear(); } // keep cache bounded
+                    c.insert(key, o.stdout);
+                }
+            }
+        }
+    }
+}
+
 pub struct Display {
     protocol: Option<Protocol>,
     active_ids: Vec<u32>,
     image_cache: HashMap<String, (u32, u16)>,  // (image_id, natural_rows)
+    pub png_cache: PngCache,
 }
 
 impl Display {
@@ -39,6 +80,7 @@ impl Display {
             protocol,
             active_ids: Vec::new(),
             image_cache: HashMap::new(),
+            png_cache: new_png_cache(),
         }
     }
 
@@ -57,6 +99,7 @@ impl Display {
             protocol,
             active_ids: Vec::new(),
             image_cache: HashMap::new(),
+            png_cache: new_png_cache(),
         }
     }
 
@@ -140,18 +183,27 @@ impl Display {
                 .as_millis() % 4294967295) as u32;
             let id = if id == 0 { 1 } else { id };
 
-            // Scale by width only (ImageMagick preserves aspect ratio)
-            let output = Command::new("convert")
-                .arg(format!("{}[0]", image_path))
-                .arg("-auto-orient")
-                .arg("-resize")
-                .arg(format!("{}>", pixel_w))
-                .arg("PNG:-")
-                .output();
+            // Check pre-convert cache first (populated by background thread)
+            let png_data = if let Ok(mut c) = self.png_cache.lock() {
+                c.remove(&cache_key)
+            } else { None };
 
-            let png_data = match output {
-                Ok(o) if !o.stdout.is_empty() => o.stdout,
-                _ => return false,
+            let png_data = match png_data {
+                Some(data) => data,
+                None => {
+                    // Fallback: convert synchronously
+                    let output = Command::new("convert")
+                        .arg(format!("{}[0]", image_path))
+                        .arg("-auto-orient")
+                        .arg("-resize")
+                        .arg(format!("{}>", pixel_w))
+                        .arg("PNG:-")
+                        .output();
+                    match output {
+                        Ok(o) if !o.stdout.is_empty() => o.stdout,
+                        _ => return false,
+                    }
+                }
             };
 
             // Get actual image height from PNG header to compute natural row count
@@ -381,7 +433,7 @@ fn png_height(data: &[u8]) -> Option<u32> {
     }
 }
 
-fn get_cell_size() -> (u16, u16) {
+pub fn get_cell_size() -> (u16, u16) {
     // Try to get pixel size from terminal
     if let Ok((rows, cols)) = crossterm_size() {
         // Try ioctl for pixel dimensions
