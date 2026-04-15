@@ -136,7 +136,7 @@ impl Display {
         match self.protocol {
             Some(Protocol::Kitty) => {
                 for id in &self.active_ids {
-                    print!("\x1b_Ga=d,d=i,i={}\x1b\\", id);
+                    print!("\x1b_Ga=d,d=i,i={},q=2\x1b\\", id);
                 }
                 if !self.active_ids.is_empty() {
                     io::stdout().flush().ok();
@@ -220,7 +220,7 @@ impl Display {
             for (idx, chunk) in chunks.iter().enumerate() {
                 let more = if idx < chunks.len() - 1 { 1 } else { 0 };
                 if idx == 0 {
-                    print!("\x1b_Ga=t,f=100,i={},m={};{}\x1b\\", id, more, chunk);
+                    print!("\x1b_Ga=t,f=100,i={},q=2,m={};{}\x1b\\", id, more, chunk);
                 } else {
                     print!("\x1b_Gm={};{}\x1b\\", more, chunk);
                 }
@@ -231,14 +231,13 @@ impl Display {
         };
 
         // Delete previous placement, then place at new position.
-        print!("\x1b_Ga=d,d=i,i={}\x1b\\", image_id);
+        print!("\x1b_Ga=d,d=i,i={},q=2\x1b\\", image_id);
         print!("\x1b[{};{}H", y, x);
         if max_height < natural_rows && natural_rows > 0 {
-            // Shrinking: scale both dimensions proportionally to maintain aspect ratio
             let scale_cols = (max_width as u32 * max_height as u32 / natural_rows as u32).max(1) as u16;
-            print!("\x1b_Ga=p,i={},c={},r={},C=1\x1b\\", image_id, scale_cols, max_height);
+            print!("\x1b_Ga=p,i={},c={},r={},q=2,C=1\x1b\\", image_id, scale_cols, max_height);
         } else {
-            print!("\x1b_Ga=p,i={},C=1\x1b\\", image_id);
+            print!("\x1b_Ga=p,i={},q=2,C=1\x1b\\", image_id);
         }
         io::stdout().flush().ok();
 
@@ -378,6 +377,32 @@ fn chafa_display(image_path: &str, x: u16, y: u16, max_width: u16, max_height: u
 }
 
 // --- Protocol detection ---
+
+/// Drain kitty graphics protocol responses from stdin.
+/// Kitty sends back "\x1b_Gi=ID;OK\x1b\\" after receiving image data.
+/// These must be consumed to prevent them from leaking into the input stream.
+fn drain_kitty_responses() {
+    use std::io::Read;
+    // Small delay to let the terminal send its response
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    // Read and discard any pending stdin data (non-blocking)
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = std::io::stdin().as_raw_fd();
+        let mut buf = [0u8; 1024];
+        unsafe {
+            // Get current flags
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            // Set non-blocking
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            // Read and discard
+            while libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) > 0 {}
+            // Restore blocking mode
+            libc::fcntl(fd, libc::F_SETFL, flags);
+        }
+    }
+}
 
 fn detect_protocol() -> Option<Protocol> {
     // Kitty
