@@ -209,10 +209,18 @@ impl Display {
                         .arg(format!("{}>", pixel_w))
                         .arg("PNG:-")
                         .output();
-                    match output {
+                    let data = match output {
                         Ok(o) if !o.stdout.is_empty() => o.stdout,
                         _ => return false,
+                    };
+                    // Populate png_cache so subsequent re-shows of the same
+                    // image (e.g. after a dir-watch reload) skip the convert
+                    // subprocess. Without this, every kitty placement that
+                    // gets cleared by clear() forces a fresh convert call.
+                    if let Ok(mut c) = self.png_cache.lock() {
+                        c.insert(cache_key.clone(), data.clone());
                     }
+                    data
                 }
             };
 
