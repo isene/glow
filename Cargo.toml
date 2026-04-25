@@ -1,6 +1,6 @@
 [package]
 name = "fe2o3-glow"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 authors = ["Geir Isene <g@isene.com>"]
 description = "Terminal image display via kitty/sixel/w3m protocols. Feature clone of termpix."

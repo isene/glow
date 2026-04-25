@@ -68,7 +68,7 @@ pub fn preconvert_images(paths: &[String], pixel_width: u32, cache: &PngCache) {
 pub struct Display {
     protocol: Option<Protocol>,
     active_ids: Vec<u32>,
-    image_cache: HashMap<String, (u32, u16)>,  // (image_id, natural_rows)
+    image_cache: HashMap<String, (u32, u16, u16)>,  // (image_id, natural_cols, natural_rows)
     pub png_cache: PngCache,
 }
 
@@ -180,9 +180,9 @@ impl Display {
         // cached id missing from active_ids signals "data may be gone" —
         // fall through and re-transmit.
         let cached_live = self.image_cache.get(&cache_key)
-            .filter(|(id, _)| self.active_ids.contains(id))
+            .filter(|(id, _, _)| self.active_ids.contains(id))
             .copied();
-        let (image_id, natural_rows) = if let Some(cached) = cached_live {
+        let (image_id, natural_cols, natural_rows) = if let Some(cached) = cached_live {
             cached
         } else {
             // Generate new ID
@@ -226,7 +226,9 @@ impl Display {
 
             // Get actual image height from PNG header to compute natural row count
             let img_pixel_h = png_height(&png_data).unwrap_or(pixel_w);
+            let img_pixel_w = png_width(&png_data).unwrap_or(pixel_w);
             let nat_rows = ((img_pixel_h as f64) / (cell_h as f64)).ceil() as u16;
+            let nat_cols = ((img_pixel_w as f64) / (cell_w as f64)).ceil() as u16;
 
             // Encode and transmit in chunks
             let encoded = base64::engine::general_purpose::STANDARD.encode(&png_data);
@@ -244,8 +246,8 @@ impl Display {
                 }
             }
             io::stdout().flush().ok();
-            self.image_cache.insert(cache_key, (id, nat_rows));
-            (id, nat_rows)
+            self.image_cache.insert(cache_key, (id, nat_cols, nat_rows));
+            (id, nat_cols, nat_rows)
         };
 
         // Delete previous placement, then place at new position with z=1.
@@ -255,10 +257,35 @@ impl Display {
         // that otherwise required a workspace switch to recover.
         print!("\x1b_Ga=d,d=i,i={},q=2\x1b\\", image_id);
         print!("\x1b[{};{}H", y, x);
-        if max_height < natural_rows && natural_rows > 0 {
-            let scale_cols = (max_width as u32 * max_height as u32 / natural_rows as u32).max(1) as u16;
-            print!("\x1b_Ga=p,i={},c={},r={},z=1,q=2,C=1\x1b\\", image_id, scale_cols, max_height);
+
+        // Scale to fit inside (max_width × max_height) cells while
+        // preserving the natural aspect ratio. Use cell pixel
+        // dimensions so the on-screen image matches the source ratio
+        // even when cell_w != cell_h.
+        let nat_w_px = natural_cols as u32 * cell_w as u32;
+        let nat_h_px = natural_rows as u32 * cell_h as u32;
+        let max_w_px = max_width as u32 * cell_w as u32;
+        let max_h_px = max_height as u32 * cell_h as u32;
+        let needs_shrink = nat_w_px > max_w_px || nat_h_px > max_h_px;
+        if needs_shrink && nat_w_px > 0 && nat_h_px > 0 {
+            // scale = min(max_w/nat_w, max_h/nat_h) in pixel space.
+            // Pick the smaller axis ratio so the image fits both.
+            let by_w = nat_h_px.saturating_mul(max_w_px) <= nat_w_px.saturating_mul(max_h_px);
+            let (out_cols, out_rows) = if by_w {
+                // Width-bound: cols = max_width, rows derived.
+                let rows = (nat_h_px as u64 * max_w_px as u64 / nat_w_px as u64) as u32;
+                let r_cells = ((rows + cell_h as u32 - 1) / cell_h as u32).max(1) as u16;
+                (max_width, r_cells)
+            } else {
+                // Height-bound: rows = max_height, cols derived.
+                let cols = (nat_w_px as u64 * max_h_px as u64 / nat_h_px as u64) as u32;
+                let c_cells = ((cols + cell_w as u32 - 1) / cell_w as u32).max(1) as u16;
+                (c_cells, max_height)
+            };
+            print!("\x1b_Ga=p,i={},c={},r={},z=1,q=2,C=1\x1b\\",
+                image_id, out_cols, out_rows);
         } else {
+            // Fits at natural size — let kitty draw 1:1 (no c/r).
             print!("\x1b_Ga=p,i={},z=1,q=2,C=1\x1b\\", image_id);
         }
         io::stdout().flush().ok();
@@ -475,6 +502,15 @@ fn command_exists(cmd: &str) -> bool {
 fn png_height(data: &[u8]) -> Option<u32> {
     if data.len() >= 24 && &data[0..4] == b"\x89PNG" {
         Some(u32::from_be_bytes([data[20], data[21], data[22], data[23]]))
+    } else {
+        None
+    }
+}
+
+/// Extract width from PNG IHDR chunk (bytes 16-19, big-endian u32)
+fn png_width(data: &[u8]) -> Option<u32> {
+    if data.len() >= 20 && &data[0..4] == b"\x89PNG" {
+        Some(u32::from_be_bytes([data[16], data[17], data[18], data[19]]))
     } else {
         None
     }
