@@ -240,14 +240,18 @@ impl Display {
             (id, nat_rows)
         };
 
-        // Delete previous placement, then place at new position.
+        // Delete previous placement, then place at new position with z=1.
+        // z=1 puts the image above pane text so concurrent terminal
+        // redraws (e.g. neighbouring tiled window expose events) cannot
+        // overdraw cells and hide the image — a kitty + tiled-WM bug
+        // that otherwise required a workspace switch to recover.
         print!("\x1b_Ga=d,d=i,i={},q=2\x1b\\", image_id);
         print!("\x1b[{};{}H", y, x);
         if max_height < natural_rows && natural_rows > 0 {
             let scale_cols = (max_width as u32 * max_height as u32 / natural_rows as u32).max(1) as u16;
-            print!("\x1b_Ga=p,i={},c={},r={},q=2,C=1\x1b\\", image_id, scale_cols, max_height);
+            print!("\x1b_Ga=p,i={},c={},r={},z=1,q=2,C=1\x1b\\", image_id, scale_cols, max_height);
         } else {
-            print!("\x1b_Ga=p,i={},q=2,C=1\x1b\\", image_id);
+            print!("\x1b_Ga=p,i={},z=1,q=2,C=1\x1b\\", image_id);
         }
         io::stdout().flush().ok();
 
