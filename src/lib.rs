@@ -173,7 +173,16 @@ impl Display {
             .unwrap_or(0);
         let cache_key = format!("{}:{}:{}", image_path, pixel_w, mtime);
 
-        let (image_id, natural_rows) = if let Some(&cached) = self.image_cache.get(&cache_key) {
+        // Cache hit only counts if the image is still considered "live"
+        // server-side. Once clear() deletes the only placement of an image
+        // id, kitty frees the image data, so a place command for that id
+        // would silently fail. active_ids is empty after clear(), so a
+        // cached id missing from active_ids signals "data may be gone" —
+        // fall through and re-transmit.
+        let cached_live = self.image_cache.get(&cache_key)
+            .filter(|(id, _)| self.active_ids.contains(id))
+            .copied();
+        let (image_id, natural_rows) = if let Some(cached) = cached_live {
             cached
         } else {
             // Generate new ID
@@ -183,9 +192,10 @@ impl Display {
                 .as_millis() % 4294967295) as u32;
             let id = if id == 0 { 1 } else { id };
 
-            // Check pre-convert cache first (populated by background thread)
-            let png_data = if let Ok(mut c) = self.png_cache.lock() {
-                c.remove(&cache_key)
+            // Check pre-convert cache first (populated by background thread).
+            // Clone instead of remove so re-shows of the same image stay cheap.
+            let png_data = if let Ok(c) = self.png_cache.lock() {
+                c.get(&cache_key).cloned()
             } else { None };
 
             let png_data = match png_data {
