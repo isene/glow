@@ -33,13 +33,13 @@ pub fn new_png_cache() -> PngCache {
 }
 
 /// Pre-convert images to PNG in background. Call from a spawned thread.
-pub fn preconvert_images(paths: &[String], pixel_width: u32, cache: &PngCache) {
+pub fn preconvert_images(paths: &[String], pixel_width: u32, pixel_height: u32, cache: &PngCache) {
     for path_str in paths {
         let mtime = std::fs::metadata(path_str)
             .and_then(|m| m.modified())
             .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs())
             .unwrap_or(0);
-        let key = format!("{}:{}:{}", path_str, pixel_width, mtime);
+        let key = format!("{}:{}x{}:{}", path_str, pixel_width, pixel_height, mtime);
 
         // Skip if already cached
         if let Ok(c) = cache.lock() {
@@ -50,7 +50,7 @@ pub fn preconvert_images(paths: &[String], pixel_width: u32, cache: &PngCache) {
             .arg(format!("{}[0]", path_str))
             .arg("-auto-orient")
             .arg("-resize")
-            .arg(format!("{}>", pixel_width))
+            .arg(format!("{}x{}>", pixel_width, pixel_height))
             .arg("PNG:-")
             .output();
 
@@ -68,7 +68,7 @@ pub fn preconvert_images(paths: &[String], pixel_width: u32, cache: &PngCache) {
 pub struct Display {
     protocol: Option<Protocol>,
     active_ids: Vec<u32>,
-    image_cache: HashMap<String, (u32, u16, u16)>,  // (image_id, natural_cols, natural_rows)
+    image_cache: HashMap<String, (u32, u16, u16)>,  // (image_id, natural_pixel_w, natural_pixel_h)
     pub png_cache: PngCache,
 }
 
@@ -165,13 +165,16 @@ impl Display {
         }
 
         let pixel_w = max_width as u32 * cell_w as u32;
+        let pixel_h = max_height as u32 * cell_h as u32;
 
-        // Cache by path + width + mtime (NOT height, so shrinking reuses cached data)
+        // Cache by path + width + height + mtime. Including height matters
+        // because a tall image may have to be height-clamped on a short
+        // pane and width-clamped on a wide pane — different convert outputs.
         let mtime = std::fs::metadata(image_path)
             .and_then(|m| m.modified())
             .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs())
             .unwrap_or(0);
-        let cache_key = format!("{}:{}:{}", image_path, pixel_w, mtime);
+        let cache_key = format!("{}:{}x{}:{}", image_path, pixel_w, pixel_h, mtime);
 
         // Cache hit only counts if the image is still considered "live"
         // server-side. Once clear() deletes the only placement of an image
@@ -182,7 +185,7 @@ impl Display {
         let cached_live = self.image_cache.get(&cache_key)
             .filter(|(id, _, _)| self.active_ids.contains(id))
             .copied();
-        let (image_id, natural_cols, natural_rows) = if let Some(cached) = cached_live {
+        let (image_id, nat_pixel_w, nat_pixel_h) = if let Some(cached) = cached_live {
             cached
         } else {
             // Generate new ID
@@ -202,11 +205,16 @@ impl Display {
                 Some(data) => data,
                 None => {
                     // Fallback: convert synchronously
+                    // Resize to fit BOTH max width AND max height (the `>`
+                    // suffix means "only shrink, never enlarge"). Without
+                    // the height bound, a square image scaled to fit a wide
+                    // pane's width can still overflow vertically into the
+                    // status bar / next pane.
                     let output = Command::new("convert")
                         .arg(format!("{}[0]", image_path))
                         .arg("-auto-orient")
                         .arg("-resize")
-                        .arg(format!("{}>", pixel_w))
+                        .arg(format!("{}x{}>", pixel_w, pixel_h))
                         .arg("PNG:-")
                         .output();
                     let data = match output {
@@ -224,11 +232,52 @@ impl Display {
                 }
             };
 
-            // Get actual image height from PNG header to compute natural row count
-            let img_pixel_h = png_height(&png_data).unwrap_or(pixel_w);
-            let img_pixel_w = png_width(&png_data).unwrap_or(pixel_w);
-            let nat_rows = ((img_pixel_h as f64) / (cell_h as f64)).ceil() as u16;
-            let nat_cols = ((img_pixel_w as f64) / (cell_w as f64)).ceil() as u16;
+            // Get actual image dimensions from PNG header
+            let raw_h = png_height(&png_data).unwrap_or(pixel_w);
+            let raw_w = png_width(&png_data).unwrap_or(pixel_w);
+
+            // Pad the PNG up to a cell-aligned multiple of (cell_w, cell_h)
+            // with transparent pixels in NorthWest gravity. This is what
+            // lets us specify c=N,r=M placement without kitty stretching
+            // the image to fill those cells: the padded canvas is exactly
+            // c*cell_w by r*cell_h pixels, image content occupies the
+            // top-left, the rest is transparent (showing the pane bg).
+            // Without this, an image whose height isn't a multiple of
+            // cell_h (e.g. 12 px tall vs 24 px cell) gets vertically
+            // stretched to fill an integer number of cell rows.
+            let pad_w = ((raw_w + cell_w as u32 - 1) / cell_w as u32) * cell_w as u32;
+            let pad_h = ((raw_h + cell_h as u32 - 1) / cell_h as u32) * cell_h as u32;
+            let png_data = if pad_w == raw_w && pad_h == raw_h {
+                png_data
+            } else {
+                use std::io::Write;
+                let mut child = match Command::new("convert")
+                    .arg("PNG:-")
+                    .arg("-background")
+                    .arg("rgba(0,0,0,0)")
+                    .arg("-gravity")
+                    .arg("NorthWest")
+                    .arg("-extent")
+                    .arg(format!("{}x{}", pad_w, pad_h))
+                    .arg("PNG:-")
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::null())
+                    .spawn() {
+                    Ok(c) => c,
+                    Err(_) => return false,
+                };
+                if let Some(mut stdin) = child.stdin.take() {
+                    let _ = stdin.write_all(&png_data);
+                }
+                match child.wait_with_output() {
+                    Ok(o) if !o.stdout.is_empty() => o.stdout,
+                    _ => return false,
+                }
+            };
+
+            let img_pixel_w = pad_w;
+            let img_pixel_h = pad_h;
 
             // Encode and transmit in chunks
             let encoded = base64::engine::general_purpose::STANDARD.encode(&png_data);
@@ -246,8 +295,14 @@ impl Display {
                 }
             }
             io::stdout().flush().ok();
-            self.image_cache.insert(cache_key, (id, nat_cols, nat_rows));
-            (id, nat_cols, nat_rows)
+            // Cache the actual PNG pixel dims (not cell-rounded) so the
+            // fit/scale math below operates on truth, not on the
+            // cell-aligned approximation. With 12-px cells a 241-px
+            // wide image rounds up to 252 px, which spuriously trips
+            // needs_shrink for any pane <252 px and ends up stretching
+            // the image vertically.
+            self.image_cache.insert(cache_key, (id, img_pixel_w as u16, img_pixel_h as u16));
+            (id, img_pixel_w as u16, img_pixel_h as u16)
         };
 
         // Delete previous placement, then place at new position with z=1.
@@ -258,36 +313,14 @@ impl Display {
         print!("\x1b_Ga=d,d=i,i={},q=2\x1b\\", image_id);
         print!("\x1b[{};{}H", y, x);
 
-        // Scale to fit inside (max_width × max_height) cells while
-        // preserving the natural aspect ratio. Use cell pixel
-        // dimensions so the on-screen image matches the source ratio
-        // even when cell_w != cell_h.
-        let nat_w_px = natural_cols as u32 * cell_w as u32;
-        let nat_h_px = natural_rows as u32 * cell_h as u32;
-        let max_w_px = max_width as u32 * cell_w as u32;
-        let max_h_px = max_height as u32 * cell_h as u32;
-        let needs_shrink = nat_w_px > max_w_px || nat_h_px > max_h_px;
-        if needs_shrink && nat_w_px > 0 && nat_h_px > 0 {
-            // scale = min(max_w/nat_w, max_h/nat_h) in pixel space.
-            // Pick the smaller axis ratio so the image fits both.
-            let by_w = nat_h_px.saturating_mul(max_w_px) <= nat_w_px.saturating_mul(max_h_px);
-            let (out_cols, out_rows) = if by_w {
-                // Width-bound: cols = max_width, rows derived.
-                let rows = (nat_h_px as u64 * max_w_px as u64 / nat_w_px as u64) as u32;
-                let r_cells = ((rows + cell_h as u32 - 1) / cell_h as u32).max(1) as u16;
-                (max_width, r_cells)
-            } else {
-                // Height-bound: rows = max_height, cols derived.
-                let cols = (nat_w_px as u64 * max_h_px as u64 / nat_h_px as u64) as u32;
-                let c_cells = ((cols + cell_w as u32 - 1) / cell_w as u32).max(1) as u16;
-                (c_cells, max_height)
-            };
-            print!("\x1b_Ga=p,i={},c={},r={},z=1,q=2,C=1\x1b\\",
-                image_id, out_cols, out_rows);
-        } else {
-            // Fits at natural size — let kitty draw 1:1 (no c/r).
-            print!("\x1b_Ga=p,i={},z=1,q=2,C=1\x1b\\", image_id);
-        }
+        // The transmitted PNG is already padded to cell-aligned dims
+        // (raw image content top-left, transparent fill below/right).
+        // So c×cell_w and r×cell_h match the PNG's pixel dims exactly,
+        // and kitty doesn't stretch.
+        let cols = (nat_pixel_w as u32 / cell_w as u32).max(1) as u16;
+        let rows = (nat_pixel_h as u32 / cell_h as u32).max(1) as u16;
+        print!("\x1b_Ga=p,i={},c={},r={},z=1,q=2,C=1\x1b\\",
+            image_id, cols, rows);
         io::stdout().flush().ok();
 
         if !self.active_ids.contains(&image_id) {
