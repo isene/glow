@@ -1,9 +1,9 @@
 [package]
 name = "fe2o3-glow"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2021"
 authors = ["Geir Isene <g@isene.com>"]
-description = "Terminal image display via kitty/sixel/w3m protocols. Feature clone of termpix."
+description = "Terminal image display via kitty/sixel/w3m/braille protocols. Feature clone of termpix."
 license = "Unlicense"
 repository = "https://github.com/isene/glow"
 keywords = ["terminal", "image", "kitty", "sixel", "tui"]

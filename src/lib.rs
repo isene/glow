@@ -23,6 +23,12 @@ pub enum Protocol {
     Sixel,
     W3m,
     Chafa,
+    /// Universal text fallback: render the image into Unicode braille
+    /// glyphs (`U+2800`–`U+28FF`). Each cell holds a 2×4 dot grid, so a
+    /// W×H char block yields a (2W)×(4H) "pixel" image. No external
+    /// dependency beyond `convert`. Works over SSH, in tmux without
+    /// passthrough, and on every terminal that can render Unicode.
+    Braille,
 }
 
 /// Pre-converted PNG data cache, shareable across threads.
@@ -84,7 +90,9 @@ impl Display {
         }
     }
 
-    /// Force a specific display mode ("auto", "ascii", "off", "kitty", "sixel")
+    /// Force a specific display mode ("auto", "ascii", "off", "kitty",
+    /// "sixel", "braille"). "braille" needs `convert` only — useful as a
+    /// graphics-free preview over SSH or in tmux without passthrough.
     pub fn with_mode(mode: &str) -> Self {
         let protocol = match mode {
             "ascii" | "chafa" => {
@@ -92,6 +100,9 @@ impl Display {
             }
             "kitty" => Some(Protocol::Kitty),
             "sixel" => Some(Protocol::Sixel),
+            "braille" => {
+                if command_exists("convert") { Some(Protocol::Braille) } else { None }
+            }
             "off" | "none" => None,
             _ => detect_protocol(), // "auto"
         };
@@ -128,6 +139,7 @@ impl Display {
             Protocol::Sixel => sixel_display(image_path, x, y, max_width, max_height),
             Protocol::W3m => w3m_display(image_path, x, y, max_width, max_height),
             Protocol::Chafa => chafa_display(image_path, x, y, max_width, max_height),
+            Protocol::Braille => braille_display(image_path, x, y, max_width, max_height),
         }
     }
 
@@ -151,6 +163,9 @@ impl Display {
             }
             Some(Protocol::Chafa) => {
                 // Chafa is text-based, cleared by terminal redraw
+            }
+            Some(Protocol::Braille) => {
+                // Braille is text-based, cleared by terminal redraw
             }
             None => {}
         }
@@ -518,7 +533,122 @@ fn detect_protocol() -> Option<Protocol> {
         return Some(Protocol::Chafa);
     }
 
+    // Braille fallback — last resort, always works as long as `convert` is
+    // available. Pure-text output, so survives SSH, tmux without
+    // passthrough, weird terminals, etc.
+    if command_exists("convert") {
+        return Some(Protocol::Braille);
+    }
+
     None
+}
+
+/// Render `path` into Unicode braille glyphs at (x, y), fitting within
+/// `max_width` × `max_height` character cells. Each cell is 2×4 dots, so the
+/// effective pixel resolution is (2·max_width) × (4·max_height). Each glyph
+/// gets the average color of its 8 source pixels via SGR truecolor — works
+/// in every modern terminal that handles 24-bit color.
+///
+/// Pipeline: `convert` resizes the image (preserving aspect, snapping the
+/// fit dims down to multiples of 2×4 so the dot grid tiles cleanly), then
+/// dumps raw RGBA. We walk 2×4 blocks: each pixel above the brightness
+/// threshold sets one dot, the cell color is the mean of the lit pixels.
+fn braille_display(path: &str, x: u16, y: u16, max_width: u16, max_height: u16) -> bool {
+    if max_width == 0 || max_height == 0 { return false; }
+
+    // Original pixel dims (for aspect-preserving fit).
+    let info = Command::new("convert")
+        .arg(format!("{}[0]", path))
+        .arg("-format").arg("%w %h")
+        .arg("info:-")
+        .output();
+    let (orig_w, orig_h) = match info {
+        Ok(o) if !o.stdout.is_empty() => {
+            let s = String::from_utf8_lossy(&o.stdout);
+            let mut it = s.split_whitespace();
+            let w: u32 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let h: u32 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            (w, h)
+        }
+        _ => return false,
+    };
+    if orig_w == 0 || orig_h == 0 { return false; }
+
+    let target_px_w = (max_width as u32) * 2;
+    let target_px_h = (max_height as u32) * 4;
+    let scale = (target_px_w as f64 / orig_w as f64)
+        .min(target_px_h as f64 / orig_h as f64);
+    let mut fit_w = (orig_w as f64 * scale).round().max(2.0) as u32;
+    let mut fit_h = (orig_h as f64 * scale).round().max(4.0) as u32;
+    // Snap down to multiples of 2×4 so the braille grid tiles cleanly.
+    fit_w -= fit_w % 2;
+    fit_h -= fit_h % 4;
+    if fit_w < 2 || fit_h < 4 { return false; }
+
+    let raw = Command::new("convert")
+        .arg(format!("{}[0]", path))
+        .arg("-auto-orient")
+        .arg("-resize").arg(format!("{}x{}!", fit_w, fit_h))
+        .arg("-depth").arg("8")
+        .arg("RGBA:-")
+        .output();
+    let bytes = match raw {
+        Ok(o) if o.stdout.len() == (fit_w as usize) * (fit_h as usize) * 4 => o.stdout,
+        _ => return false,
+    };
+
+    let cells_w = (fit_w / 2) as u16;
+    let cells_h = (fit_h / 4) as u16;
+    // Braille dot bit values — column-major, top to bottom:
+    //   col 0 row 0 = 0x01   col 1 row 0 = 0x08
+    //   col 0 row 1 = 0x02   col 1 row 1 = 0x10
+    //   col 0 row 2 = 0x04   col 1 row 2 = 0x20
+    //   col 0 row 3 = 0x40   col 1 row 3 = 0x80
+    const DOT_BITS: [(u32, u32, u32); 8] = [
+        (0, 0, 0x01), (0, 1, 0x02), (0, 2, 0x04), (0, 3, 0x40),
+        (1, 0, 0x08), (1, 1, 0x10), (1, 2, 0x20), (1, 3, 0x80),
+    ];
+
+    let mut out = String::with_capacity((cells_w as usize) * (cells_h as usize) * 24);
+    for cy in 0..cells_h {
+        out.push_str(&format!("\x1b[{};{}H", y + cy, x));
+        for cx in 0..cells_w {
+            let bx = (cx as u32) * 2;
+            let by = (cy as u32) * 4;
+            let mut mask: u32 = 0x2800;
+            let mut r_sum: u32 = 0;
+            let mut g_sum: u32 = 0;
+            let mut b_sum: u32 = 0;
+            let mut lit: u32 = 0;
+            for (dx, dy, bit) in &DOT_BITS {
+                let i = (((by + dy) * fit_w + (bx + dx)) * 4) as usize;
+                let r = bytes[i] as u32;
+                let g = bytes[i + 1] as u32;
+                let b = bytes[i + 2] as u32;
+                let a = bytes[i + 3] as u32;
+                // Lit if not transparent and darker than mid-gray (so light
+                // bgs render as empty cells rather than a solid block).
+                let bright = (r + g + b) / 3;
+                if a > 64 && bright < 200 {
+                    mask |= bit;
+                    r_sum += r; g_sum += g; b_sum += b;
+                    lit += 1;
+                }
+            }
+            let ch = char::from_u32(mask).unwrap_or(' ');
+            if lit > 0 {
+                let r = (r_sum / lit) as u8;
+                let g = (g_sum / lit) as u8;
+                let b = (b_sum / lit) as u8;
+                out.push_str(&format!("\x1b[38;2;{};{};{}m{}\x1b[39m", r, g, b, ch));
+            } else {
+                out.push(' ');
+            }
+        }
+    }
+    let _ = io::stdout().write_all(out.as_bytes());
+    let _ = io::stdout().flush();
+    true
 }
 
 fn command_exists(cmd: &str) -> bool {
