@@ -143,6 +143,62 @@ impl Display {
         }
     }
 
+    /// Show a cropped vertical slice of an image. The image is sized for
+    /// `(max_width, max_height)` cells (its full natural rendered dims),
+    /// then only rows `[src_top_cells, src_top_cells + src_visible_cells)`
+    /// are placed at screen `(x, y)`. Cache key uses `(max_width,
+    /// max_height)` so scrolling an image into/out of a viewport
+    /// reuses the same cached image_id — no fresh transmission, no
+    /// new IMG_SLOT consumed in glass per scroll line. Used by scroll
+    /// and other callers that page images at viewport edges.
+    /// Falls back to non-clipped `show` for protocols other than kitty.
+    pub fn show_clipped(&mut self, image_path: &str, x: u16, y: u16,
+                        max_width: u16, max_height: u16,
+                        src_top_cells: u16, src_visible_cells: u16) -> bool {
+        let proto = match self.protocol {
+            Some(p) => p,
+            None => return false,
+        };
+        if !Path::new(image_path).exists() {
+            return false;
+        }
+        match proto {
+            Protocol::Kitty => self.kitty_display_clipped(
+                image_path, x, y, max_width, max_height,
+                src_top_cells, src_visible_cells),
+            // Other protocols don't support source-rect cropping —
+            // fall back to placing what fits.
+            _ => self.show(image_path, x, y, max_width, src_visible_cells.max(1)),
+        }
+    }
+
+    /// Delete just the placement(s) for `image_path` (per-id `a=d,d=i`).
+    /// Lets callers do per-image diffs without nuking every active id —
+    /// otherwise every line of scrolling burns fresh IMG_SLOTS for
+    /// images that haven't actually changed. Match is by path prefix
+    /// (cache key is `path:WxH:mtime`), so all entries for the same
+    /// path get cleared together (covers width changes from pane resize).
+    pub fn forget_path(&mut self, image_path: &str) {
+        if !matches!(self.protocol, Some(Protocol::Kitty)) {
+            // Only kitty has per-id placements; other protocols rely on
+            // text redraw and have nothing to forget here.
+            return;
+        }
+        let prefix = format!("{}:", image_path);
+        let mut ids_to_forget: Vec<u32> = Vec::new();
+        for (key, (id, _, _)) in &self.image_cache {
+            if key.starts_with(&prefix) && self.active_ids.contains(id) {
+                ids_to_forget.push(*id);
+            }
+        }
+        if ids_to_forget.is_empty() { return; }
+        for id in &ids_to_forget {
+            print!("\x1b_Ga=d,d=i,i={},q=2\x1b\\", id);
+        }
+        io::stdout().flush().ok();
+        self.active_ids.retain(|id| !ids_to_forget.contains(id));
+    }
+
     /// Clear all displayed images
     pub fn clear(&mut self, x: u16, y: u16, width: u16, height: u16, term_width: u16, term_height: u16) {
         match self.protocol {
@@ -172,6 +228,147 @@ impl Display {
     }
 
     // --- Kitty protocol ---
+
+    /// Ensure image data for `(image_path, max_width, max_height)` is
+    /// present server-side. Returns `(image_id, padded_pixel_w,
+    /// padded_pixel_h, cell_w, cell_h)`. Cache lookup is by
+    /// `(path, pixel_w, pixel_h, mtime)` — callers wanting stable
+    /// cache hits across viewport-edge clipping should pass the FULL
+    /// natural rendered size (not the visible-portion size).
+    fn kitty_ensure(&mut self, image_path: &str, max_width: u16, max_height: u16)
+        -> Option<(u32, u16, u16, u16, u16)>
+    {
+        let (cell_w, cell_h) = get_cell_size();
+        if cell_w == 0 || cell_h == 0 { return None; }
+        let pixel_w = max_width as u32 * cell_w as u32;
+        let pixel_h = max_height as u32 * cell_h as u32;
+        let mtime = std::fs::metadata(image_path)
+            .and_then(|m| m.modified())
+            .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs())
+            .unwrap_or(0);
+        let cache_key = format!("{}:{}x{}:{}", image_path, pixel_w, pixel_h, mtime);
+        let cached_live = self.image_cache.get(&cache_key)
+            .filter(|(id, _, _)| self.active_ids.contains(id))
+            .copied();
+        if let Some((id, pw, ph)) = cached_live {
+            return Some((id, pw, ph, cell_w, cell_h));
+        }
+        // Cache miss for this (path, w, h). Forget any other live
+        // placements of the same path (different cache_keys from
+        // earlier non-clipped sizes) — otherwise they ride the DEC
+        // scroll region as ghosts.
+        self.forget_path(image_path);
+        let id = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() % 4294967295) as u32;
+        let id = if id == 0 { 1 } else { id };
+        let png_data = if let Ok(c) = self.png_cache.lock() {
+            c.get(&cache_key).cloned()
+        } else { None };
+        let png_data = match png_data {
+            Some(data) => data,
+            None => {
+                let output = Command::new("convert")
+                    .arg(format!("{}[0]", image_path))
+                    .arg("-auto-orient")
+                    .arg("-resize")
+                    .arg(format!("{}x{}>", pixel_w, pixel_h))
+                    .arg("PNG:-")
+                    .output();
+                let data = match output {
+                    Ok(o) if !o.stdout.is_empty() => o.stdout,
+                    _ => return None,
+                };
+                if let Ok(mut c) = self.png_cache.lock() {
+                    c.insert(cache_key.clone(), data.clone());
+                }
+                data
+            }
+        };
+        let raw_h = png_height(&png_data).unwrap_or(pixel_w);
+        let raw_w = png_width(&png_data).unwrap_or(pixel_w);
+        let pad_w = ((raw_w + cell_w as u32 - 1) / cell_w as u32) * cell_w as u32;
+        let pad_h = ((raw_h + cell_h as u32 - 1) / cell_h as u32) * cell_h as u32;
+        let png_data = if pad_w == raw_w && pad_h == raw_h {
+            png_data
+        } else {
+            use std::io::Write;
+            let mut child = match Command::new("convert")
+                .arg("PNG:-")
+                .arg("-background")
+                .arg("rgba(0,0,0,0)")
+                .arg("-gravity")
+                .arg("NorthWest")
+                .arg("-extent")
+                .arg(format!("{}x{}", pad_w, pad_h))
+                .arg("PNG:-")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn() {
+                Ok(c) => c,
+                Err(_) => return None,
+            };
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(&png_data);
+            }
+            match child.wait_with_output() {
+                Ok(o) if !o.stdout.is_empty() => o.stdout,
+                _ => return None,
+            }
+        };
+        let img_pixel_w = pad_w as u16;
+        let img_pixel_h = pad_h as u16;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&png_data);
+        let chunks: Vec<&str> = encoded.as_bytes()
+            .chunks(4096)
+            .map(|c| std::str::from_utf8(c).unwrap_or(""))
+            .collect();
+        for (idx, chunk) in chunks.iter().enumerate() {
+            let more = if idx < chunks.len() - 1 { 1 } else { 0 };
+            if idx == 0 {
+                print!("\x1b_Ga=t,f=100,i={},q=2,m={};{}\x1b\\", id, more, chunk);
+            } else {
+                print!("\x1b_Gm={};{}\x1b\\", more, chunk);
+            }
+        }
+        io::stdout().flush().ok();
+        self.image_cache.insert(cache_key, (id, img_pixel_w, img_pixel_h));
+        if !self.active_ids.contains(&id) {
+            self.active_ids.push(id);
+        }
+        Some((id, img_pixel_w, img_pixel_h, cell_w, cell_h))
+    }
+
+    fn kitty_display_clipped(&mut self, image_path: &str, x: u16, y: u16,
+                             max_width: u16, max_height: u16,
+                             src_top_cells: u16, src_visible_cells: u16) -> bool {
+        let (image_id, pad_w, pad_h, cell_w, cell_h) =
+            match self.kitty_ensure(image_path, max_width, max_height) {
+                Some(t) => t,
+                None => return false,
+            };
+        let visible = src_visible_cells.max(1);
+        let src_y_px = (src_top_cells as u32 * cell_h as u32).min(pad_h as u32);
+        let src_h_px = (visible as u32 * cell_h as u32).min(pad_h as u32 - src_y_px);
+        if src_h_px == 0 { return false; }
+        // Move existing placement (per-id delete) then place at new
+        // position with source-rect crop. Same image_id is reused
+        // every scroll line — no re-transmit, no IMG_SLOT churn.
+        print!("\x1b_Ga=d,d=i,i={},q=2\x1b\\", image_id);
+        print!("\x1b[{};{}H", y, x);
+        let cols = (pad_w as u32 / cell_w as u32).max(1) as u16;
+        let rows = (src_h_px / cell_h as u32).max(1) as u16;
+        // Lowercase x,y,w,h in place command = source-rect crop in pixels.
+        print!("\x1b_Ga=p,i={},x=0,y={},w={},h={},c={},r={},z=1,q=2,C=1\x1b\\",
+            image_id, src_y_px, pad_w, src_h_px, cols, rows);
+        io::stdout().flush().ok();
+        if !self.active_ids.contains(&image_id) {
+            self.active_ids.push(image_id);
+        }
+        true
+    }
 
     fn kitty_display(&mut self, image_path: &str, x: u16, y: u16, max_width: u16, max_height: u16) -> bool {
         let (cell_w, cell_h) = get_cell_size();
@@ -203,6 +400,13 @@ impl Display {
         let (image_id, nat_pixel_w, nat_pixel_h) = if let Some(cached) = cached_live {
             cached
         } else {
+            // Cache miss for this (path, w, h). If we have other live
+            // placements of the same path under a different cache_key
+            // (typically: caller varied max_height as the image clipped
+            // at viewport edges), kill them first. Otherwise the per-id
+            // delete below is a no-op for those stale ids and they keep
+            // riding the DEC scroll region as ghost duplicates.
+            self.forget_path(image_path);
             // Generate new ID
             let id = (std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
