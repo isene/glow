@@ -52,7 +52,7 @@ pub fn preconvert_images(paths: &[String], pixel_width: u32, pixel_height: u32, 
             if c.contains_key(&key) { continue; }
         }
 
-        let output = Command::new("convert")
+        let output = Command::new(imagemagick_cmd())
             .arg(format!("{}[0]", path_str))
             .arg("-auto-orient")
             .arg("-resize")
@@ -101,7 +101,7 @@ impl Display {
             "kitty" => Some(Protocol::Kitty),
             "sixel" => Some(Protocol::Sixel),
             "braille" => {
-                if command_exists("convert") { Some(Protocol::Braille) } else { None }
+                if command_exists(imagemagick_cmd()) { Some(Protocol::Braille) } else { None }
             }
             "off" | "none" => None,
             _ => detect_protocol(), // "auto"
@@ -269,7 +269,7 @@ impl Display {
         let png_data = match png_data {
             Some(data) => data,
             None => {
-                let output = Command::new("convert")
+                let output = Command::new(imagemagick_cmd())
                     .arg(format!("{}[0]", image_path))
                     .arg("-auto-orient")
                     .arg("-resize")
@@ -294,7 +294,7 @@ impl Display {
             png_data
         } else {
             use std::io::Write;
-            let mut child = match Command::new("convert")
+            let mut child = match Command::new(imagemagick_cmd())
                 .arg("PNG:-")
                 .arg("-background")
                 .arg("rgba(0,0,0,0)")
@@ -429,7 +429,7 @@ impl Display {
                     // the height bound, a square image scaled to fit a wide
                     // pane's width can still overflow vertically into the
                     // status bar / next pane.
-                    let output = Command::new("convert")
+                    let output = Command::new(imagemagick_cmd())
                         .arg(format!("{}[0]", image_path))
                         .arg("-auto-orient")
                         .arg("-resize")
@@ -470,7 +470,7 @@ impl Display {
                 png_data
             } else {
                 use std::io::Write;
-                let mut child = match Command::new("convert")
+                let mut child = match Command::new(imagemagick_cmd())
                     .arg("PNG:-")
                     .arg("-background")
                     .arg("rgba(0,0,0,0)")
@@ -557,7 +557,7 @@ fn sixel_display(image_path: &str, x: u16, y: u16, max_width: u16, max_height: u
     print!("\x1b[{};{}H", y, x);
     io::stdout().flush().ok();
     let escaped = shell_escape(image_path);
-    Command::new("convert")
+    Command::new(imagemagick_cmd())
         .arg(&escaped)
         .arg("-resize")
         .arg(format!("{}x{}\\>", pixel_w, pixel_h))
@@ -712,7 +712,7 @@ fn detect_protocol() -> Option<Protocol> {
         || std::env::var("TERM_PROGRAM").unwrap_or_default() == "WezTerm"
         || std::env::var("WEZTERM_EXECUTABLE").is_ok()
     {
-        if command_exists("convert") {
+        if command_exists(imagemagick_cmd()) {
             return Some(Protocol::Kitty);
         }
     }
@@ -720,7 +720,7 @@ fn detect_protocol() -> Option<Protocol> {
     // Sixel (xterm, mlterm, foot)
     let term = std::env::var("TERM").unwrap_or_default();
     if term.starts_with("xterm") && term != "xterm-kitty" || term.starts_with("mlterm") || term.starts_with("foot") {
-        if command_exists("convert") {
+        if command_exists(imagemagick_cmd()) {
             return Some(Protocol::Sixel);
         }
     }
@@ -740,7 +740,7 @@ fn detect_protocol() -> Option<Protocol> {
     // Braille fallback — last resort, always works as long as `convert` is
     // available. Pure-text output, so survives SSH, tmux without
     // passthrough, weird terminals, etc.
-    if command_exists("convert") {
+    if command_exists(imagemagick_cmd()) {
         return Some(Protocol::Braille);
     }
 
@@ -761,7 +761,7 @@ fn braille_display(path: &str, x: u16, y: u16, max_width: u16, max_height: u16) 
     if max_width == 0 || max_height == 0 { return false; }
 
     // Original pixel dims (for aspect-preserving fit).
-    let info = Command::new("convert")
+    let info = Command::new(imagemagick_cmd())
         .arg(format!("{}[0]", path))
         .arg("-format").arg("%w %h")
         .arg("info:-")
@@ -789,7 +789,7 @@ fn braille_display(path: &str, x: u16, y: u16, max_width: u16, max_height: u16) 
     fit_h -= fit_h % 4;
     if fit_w < 2 || fit_h < 4 { return false; }
 
-    let raw = Command::new("convert")
+    let raw = Command::new(imagemagick_cmd())
         .arg(format!("{}[0]", path))
         .arg("-auto-orient")
         .arg("-resize").arg(format!("{}x{}!", fit_w, fit_h))
@@ -863,6 +863,17 @@ fn command_exists(cmd: &str) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// Pick the ImageMagick CLI binary name. IM7 prefers `magick`; the
+/// legacy `convert` symlink prints a deprecation warning on some
+/// distros (Arch/Endeavour) which then bleeds onto the user's
+/// terminal during a render pass. Resolved once per process.
+fn imagemagick_cmd() -> &'static str {
+    static CHOICE: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    CHOICE.get_or_init(|| {
+        if command_exists("magick") { "magick" } else { "convert" }
+    })
 }
 
 /// Extract height from PNG IHDR chunk (bytes 20-23, big-endian u32)
