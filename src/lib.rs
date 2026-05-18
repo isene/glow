@@ -39,19 +39,43 @@ pub fn new_png_cache() -> PngCache {
 }
 
 /// Pre-convert images to PNG in background. Call from a spawned thread.
-pub fn preconvert_images(paths: &[String], pixel_width: u32, pixel_height: u32, cache: &PngCache) {
+/// Background-convert a list of images, store cell-aligned (padded)
+/// PNG output in `cache`. The padding step runs here so the
+/// foreground show path can use the cached entry directly — no
+/// second `convert` subprocess at display time.
+///
+/// `cell_w` / `cell_h` are the host terminal's cell dimensions in
+/// pixels. They're passed in (instead of probed inside) because the
+/// caller knows them at trigger time and ioctl probing from a worker
+/// thread isn't guaranteed to see the right TTY.
+///
+/// `cancel` is checked between paths so a precache run can bail out
+/// quickly when the user navigates away from the directory.
+pub fn preconvert_images(
+    paths: &[String],
+    pixel_width: u32,
+    pixel_height: u32,
+    cell_w: u16,
+    cell_h: u16,
+    cache: &PngCache,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::Ordering;
     for path_str in paths {
+        if let Some(c) = cancel { if c.load(Ordering::Relaxed) { return; } }
+
         let mtime = std::fs::metadata(path_str)
             .and_then(|m| m.modified())
             .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs())
             .unwrap_or(0);
         let key = format!("{}:{}x{}:{}", path_str, pixel_width, pixel_height, mtime);
 
-        // Skip if already cached
+        // Skip if already cached (padded data — see insert below).
         if let Ok(c) = cache.lock() {
             if c.contains_key(&key) { continue; }
         }
 
+        // Resize.
         let output = Command::new(imagemagick_cmd())
             .arg(format!("{}[0]", path_str))
             .arg("-auto-orient")
@@ -59,14 +83,62 @@ pub fn preconvert_images(paths: &[String], pixel_width: u32, pixel_height: u32, 
             .arg(format!("{}x{}>", pixel_width, pixel_height))
             .arg("PNG:-")
             .output();
+        let raw_data = match output {
+            Ok(o) if !o.stdout.is_empty() => o.stdout,
+            _ => continue,
+        };
 
-        if let Ok(o) = output {
-            if !o.stdout.is_empty() {
-                if let Ok(mut c) = cache.lock() {
-                    if c.len() > 32 { c.clear(); } // keep cache bounded
-                    c.insert(key, o.stdout);
-                }
+        // Pad to cell-aligned dims so the foreground show path's
+        // `raw_w == pad_w && raw_h == pad_h` check skips its own
+        // pad subprocess. Same convert invocation as the sync
+        // pad path in kitty_display, just done off the hot path.
+        let raw_w = png_width(&raw_data).unwrap_or(pixel_width);
+        let raw_h = png_height(&raw_data).unwrap_or(pixel_height);
+        let pad_w = if cell_w > 0 {
+            ((raw_w + cell_w as u32 - 1) / cell_w as u32) * cell_w as u32
+        } else { raw_w };
+        let pad_h = if cell_h > 0 {
+            ((raw_h + cell_h as u32 - 1) / cell_h as u32) * cell_h as u32
+        } else { raw_h };
+
+        let final_data = if pad_w == raw_w && pad_h == raw_h {
+            raw_data
+        } else {
+            use std::io::Write;
+            let mut child = match Command::new(imagemagick_cmd())
+                .arg("PNG:-")
+                .arg("-background").arg("rgba(0,0,0,0)")
+                .arg("-gravity").arg("NorthWest")
+                .arg("-extent").arg(format!("{}x{}", pad_w, pad_h))
+                .arg("PNG:-")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn() {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(&raw_data);
             }
+            match child.wait_with_output() {
+                Ok(o) if !o.stdout.is_empty() => o.stdout,
+                _ => continue,
+            }
+        };
+
+        if let Ok(mut c) = cache.lock() {
+            // Bigger cap (256 ≈ 256 MB worst-case for ~1 MB padded
+            // PNGs). When over, drop arbitrary entries down to 200
+            // — HashMap iter order is randomized so this is roughly
+            // random eviction, which is fine for an in-session cache
+            // where re-inserts on revisit keep hot entries alive.
+            if c.len() >= 256 {
+                let to_drop: Vec<String> = c.keys().take(c.len().saturating_sub(200))
+                    .cloned().collect();
+                for k in to_drop { c.remove(&k); }
+            }
+            c.insert(key, final_data);
         }
     }
 }
@@ -318,6 +390,13 @@ impl Display {
                 _ => return None,
             }
         };
+        // Cache the cell-aligned PNG (see kitty_display for full
+        // rationale). On revisit, the pad subprocess is skipped
+        // because raw_w/raw_h read from this cached PNG already
+        // equal pad_w/pad_h.
+        if let Ok(mut c) = self.png_cache.lock() {
+            c.insert(cache_key.clone(), png_data.clone());
+        }
         let img_pixel_w = pad_w as u16;
         let img_pixel_h = pad_h as u16;
         let encoded = base64::engine::general_purpose::STANDARD.encode(&png_data);
@@ -356,7 +435,14 @@ impl Display {
         // Move existing placement (per-id delete) then place at new
         // position with source-rect crop. Same image_id is reused
         // every scroll line — no re-transmit, no IMG_SLOT churn.
-        print!("\x1b_Ga=d,d=i,i={},q=2\x1b\\", image_id);
+        //
+        // Skip the delete on the cache-miss path (no prior placement
+        // yet) — see kitty_display for the full rationale on the
+        // delete-before-place race.
+        let already_placed = self.active_ids.contains(&image_id);
+        if already_placed {
+            print!("\x1b_Ga=d,d=i,i={},q=2\x1b\\", image_id);
+        }
         print!("\x1b[{};{}H", y, x);
         let cols = (pad_w as u32 / cell_w as u32).max(1) as u16;
         let rows = (src_h_px / cell_h as u32).max(1) as u16;
@@ -364,7 +450,7 @@ impl Display {
         print!("\x1b_Ga=p,i={},x=0,y={},w={},h={},c={},r={},z=1,q=2,C=1\x1b\\",
             image_id, src_y_px, pad_w, src_h_px, cols, rows);
         io::stdout().flush().ok();
-        if !self.active_ids.contains(&image_id) {
+        if !already_placed {
             self.active_ids.push(image_id);
         }
         true
@@ -495,6 +581,20 @@ impl Display {
                 }
             };
 
+            // Cache the cell-aligned PNG (whether we just padded or
+            // it was already aligned). On revisit, the cached entry
+            // is ready to transmit: raw_w/raw_h reads from this PNG
+            // equal pad_w/pad_h, so the pad subprocess branch above
+            // is skipped. That's the difference between a snappy
+            // revisit and a slow one — and it also removes the most
+            // common silent-failure surface (a 2nd fork of `convert`
+            // for padding while the bg preconvert thread is forking
+            // too). Replaces the unpadded copy that the convert
+            // branch may have inserted earlier under the same key.
+            if let Ok(mut c) = self.png_cache.lock() {
+                c.insert(cache_key.clone(), png_data.clone());
+            }
+
             let img_pixel_w = pad_w;
             let img_pixel_h = pad_h;
 
@@ -524,12 +624,25 @@ impl Display {
             (id, img_pixel_w as u16, img_pixel_h as u16)
         };
 
-        // Delete previous placement, then place at new position with z=1.
+        // Delete previous placement (only if one exists) then place at
+        // new position with z=1.
+        //
+        // The delete must NOT fire on the cache-miss path: there we
+        // just transmitted fresh data with no placement yet, so a
+        // `d=i` would tell kitty "image X has zero placements" — and
+        // depending on timing kitty may free the data before the
+        // following place command attaches. The 1-in-20 silent
+        // "image doesn't show until I press Enter" race lived here.
+        //
         // z=1 puts the image above pane text so concurrent terminal
-        // redraws (e.g. neighbouring tiled window expose events) cannot
-        // overdraw cells and hide the image — a kitty + tiled-WM bug
-        // that otherwise required a workspace switch to recover.
-        print!("\x1b_Ga=d,d=i,i={},q=2\x1b\\", image_id);
+        // redraws (e.g. neighbouring tiled window expose events)
+        // cannot overdraw cells and hide the image — a kitty +
+        // tiled-WM bug that otherwise required a workspace switch
+        // to recover.
+        let already_placed = self.active_ids.contains(&image_id);
+        if already_placed {
+            print!("\x1b_Ga=d,d=i,i={},q=2\x1b\\", image_id);
+        }
         print!("\x1b[{};{}H", y, x);
 
         // The transmitted PNG is already padded to cell-aligned dims
@@ -542,7 +655,7 @@ impl Display {
             image_id, cols, rows);
         io::stdout().flush().ok();
 
-        if !self.active_ids.contains(&image_id) {
+        if !already_placed {
             self.active_ids.push(image_id);
         }
         true
