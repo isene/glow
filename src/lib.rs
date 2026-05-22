@@ -115,6 +115,79 @@ fn cache_put(cache: &PngCache, key: String, data: Vec<u8>) {
     }
 }
 
+/// Phase 2 — Rust-side resize + transparent extent.
+///
+/// Reads the image file, downscales to fit within `(max_w, max_h)`
+/// (preserving aspect ratio, never enlarging — same semantics as
+/// ImageMagick's `WxH>` modifier), pads up to the next `(cell_w,
+/// cell_h)` multiple at NorthWest gravity so kitty can place it at
+/// integer cell dimensions without stretching, and re-encodes as
+/// PNG. Returns the PNG bytes.
+///
+/// Returns None on unsupported formats / decode errors — the caller
+/// drops to the `magick` subprocess fallback which handles HEIC /
+/// SVG / weird CMYK JPEGs etc. that the `image` crate doesn't cover.
+fn rust_resize_and_pad(
+    path: &str,
+    max_w: u32, max_h: u32,
+    cell_w: u32, cell_h: u32,
+) -> Option<Vec<u8>> {
+    use image::{ImageReader, ImageBuffer, Rgba, imageops::FilterType};
+
+    let reader = ImageReader::open(path).ok()?
+        .with_guessed_format().ok()?;
+    let img = reader.decode().ok()?;
+
+    // Resize only if image overflows the bounds.
+    let (sw, sh) = (img.width(), img.height());
+    let resized = if sw <= max_w && sh <= max_h {
+        img
+    } else {
+        // Triangle filter ≈ bilinear: decent quality, much faster than
+        // Lanczos3 on the hot path. Visually indistinguishable at the
+        // sub-300px sizes the inline-preview pane uses.
+        img.resize(max_w, max_h, FilterType::Triangle)
+    };
+    let (rw, rh) = (resized.width(), resized.height());
+
+    // Cell-aligned padding (mirrors the magick `-extent` step in the
+    // old path). Round each dim up to the next cell multiple so kitty
+    // can specify integer `c=cols,r=rows` without stretching content.
+    let cw = cell_w.max(1);
+    let ch = cell_h.max(1);
+    let pad_w = ((rw + cw - 1) / cw) * cw;
+    let pad_h = ((rh + ch - 1) / ch) * ch;
+
+    // Skip the compose pass entirely when the resized image already
+    // sits on cell boundaries — happens for screenshots, pixel art,
+    // any image whose natural dims happen to be cell-aligned.
+    if rw == pad_w && rh == pad_h {
+        let mut out: Vec<u8> = Vec::new();
+        encode_png(&resized.to_rgba8(), rw, rh, &mut out)?;
+        return Some(out);
+    }
+
+    let mut canvas: ImageBuffer<Rgba<u8>, Vec<u8>> =
+        ImageBuffer::from_pixel(pad_w, pad_h, Rgba([0, 0, 0, 0]));
+    let resized_rgba = resized.to_rgba8();
+    image::imageops::overlay(&mut canvas, &resized_rgba, 0, 0);
+
+    let mut out: Vec<u8> = Vec::new();
+    encode_png(&canvas, pad_w, pad_h, &mut out)?;
+    Some(out)
+}
+
+fn encode_png(
+    buf: &image::ImageBuffer<image::Rgba<u8>, Vec<u8>>,
+    w: u32, h: u32, out: &mut Vec<u8>,
+) -> Option<()> {
+    use image::codecs::png::{PngEncoder, CompressionType, FilterType as PngFilter};
+    use image::ImageEncoder;
+    out.reserve(w as usize * h as usize);
+    PngEncoder::new_with_quality(out, CompressionType::Fast, PngFilter::NoFilter)
+        .write_image(buf.as_raw(), w, h, image::ExtendedColorType::Rgba8).ok()
+}
+
 /// Pre-convert images to PNG in background. Call from a spawned thread.
 /// Background-convert a list of images, store cell-aligned (padded)
 /// PNG output in `cache`. The padding step runs here so the
@@ -152,6 +225,19 @@ pub fn preconvert_images(
         // After a kastrup restart, RAM is empty but disk usually has
         // every recently-viewed image already converted.
         if cache_contains(cache, &key) { continue; }
+
+        // Phase 2: try the Rust `image` crate first. Decode + resize +
+        // cell-aligned pad in one pass, no subprocess. Falls through
+        // to the magick subprocess path only on decode failure
+        // (unsupported format, EXIF orientation we can't trivially
+        // handle, etc.).
+        if let Some(final_data) = rust_resize_and_pad(
+            path_str, pixel_width, pixel_height,
+            cell_w as u32, cell_h as u32,
+        ) {
+            cache_put(cache, key, final_data);
+            continue;
+        }
 
         // Resize.
         let output = Command::new(imagemagick_cmd())
@@ -567,94 +653,77 @@ impl Display {
 
             // Two-tier cache: in-RAM first, fall back to the on-disk
             // PNG cache populated by previous runs. Either path skips
-            // the `convert` subprocess entirely. The disk fallback is
-            // what makes the SECOND launch of kastrup show images
-            // instantly — RAM is empty on every new process.
+            // image processing entirely.
+            //
+            // Cache miss → Phase 2 Rust pipeline (`image` crate)
+            // does decode + resize + cell-aligned pad in one pass.
+            // Falls through to the `magick` subprocess only when the
+            // Rust pipeline can't decode (HEIC, SVG, weird CMYK
+            // JPEG, etc.).
             let png_data = match cache_get(&self.png_cache, &cache_key) {
                 Some(data) => data,
                 None => {
-                    // Fallback: convert synchronously
-                    // Resize to fit BOTH max width AND max height (the `>`
-                    // suffix means "only shrink, never enlarge"). Without
-                    // the height bound, a square image scaled to fit a wide
-                    // pane's width can still overflow vertically into the
-                    // status bar / next pane.
-                    let output = Command::new(imagemagick_cmd())
-                        .arg(format!("{}[0]", image_path))
-                        .arg("-auto-orient")
-                        .arg("-resize")
-                        .arg(format!("{}x{}>", pixel_w, pixel_h))
-                        .arg("PNG:-")
-                        .output();
-                    let data = match output {
-                        Ok(o) if !o.stdout.is_empty() => o.stdout,
-                        _ => return false,
-                    };
-                    // Populate BOTH tiers so re-shows of the same image
-                    // (even across kastrup restarts) skip the convert
-                    // subprocess.
-                    cache_put(&self.png_cache, cache_key.clone(), data.clone());
-                    data
+                    // Phase 2: Rust-side resize + pad.
+                    if let Some(data) = rust_resize_and_pad(
+                        image_path, pixel_w, pixel_h,
+                        cell_w as u32, cell_h as u32,
+                    ) {
+                        cache_put(&self.png_cache, cache_key.clone(), data.clone());
+                        data
+                    } else {
+                        // Magick fallback: resize, then optional pad.
+                        let output = Command::new(imagemagick_cmd())
+                            .arg(format!("{}[0]", image_path))
+                            .arg("-auto-orient")
+                            .arg("-resize")
+                            .arg(format!("{}x{}>", pixel_w, pixel_h))
+                            .arg("PNG:-")
+                            .output();
+                        let raw_data = match output {
+                            Ok(o) if !o.stdout.is_empty() => o.stdout,
+                            _ => return false,
+                        };
+                        let raw_h = png_height(&raw_data).unwrap_or(pixel_w);
+                        let raw_w = png_width(&raw_data).unwrap_or(pixel_w);
+                        let pad_w = ((raw_w + cell_w as u32 - 1) / cell_w as u32) * cell_w as u32;
+                        let pad_h = ((raw_h + cell_h as u32 - 1) / cell_h as u32) * cell_h as u32;
+                        let final_data = if pad_w == raw_w && pad_h == raw_h {
+                            raw_data
+                        } else {
+                            use std::io::Write;
+                            let mut child = match Command::new(imagemagick_cmd())
+                                .arg("PNG:-")
+                                .arg("-background").arg("rgba(0,0,0,0)")
+                                .arg("-gravity").arg("NorthWest")
+                                .arg("-extent").arg(format!("{}x{}", pad_w, pad_h))
+                                .arg("PNG:-")
+                                .stdin(std::process::Stdio::piped())
+                                .stdout(std::process::Stdio::piped())
+                                .stderr(std::process::Stdio::null())
+                                .spawn() {
+                                Ok(c) => c,
+                                Err(_) => return false,
+                            };
+                            if let Some(mut stdin) = child.stdin.take() {
+                                let _ = stdin.write_all(&raw_data);
+                            }
+                            match child.wait_with_output() {
+                                Ok(o) if !o.stdout.is_empty() => o.stdout,
+                                _ => return false,
+                            }
+                        };
+                        cache_put(&self.png_cache, cache_key.clone(), final_data.clone());
+                        final_data
+                    }
                 }
             };
 
-            // Get actual image dimensions from PNG header
+            // Read the actual padded dims from the PNG header — either
+            // tier returns already-padded data, so raw_w/raw_h == pad_w/pad_h.
             let raw_h = png_height(&png_data).unwrap_or(pixel_w);
             let raw_w = png_width(&png_data).unwrap_or(pixel_w);
-
-            // Pad the PNG up to a cell-aligned multiple of (cell_w, cell_h)
-            // with transparent pixels in NorthWest gravity. This is what
-            // lets us specify c=N,r=M placement without kitty stretching
-            // the image to fill those cells: the padded canvas is exactly
-            // c*cell_w by r*cell_h pixels, image content occupies the
-            // top-left, the rest is transparent (showing the pane bg).
-            // Without this, an image whose height isn't a multiple of
-            // cell_h (e.g. 12 px tall vs 24 px cell) gets vertically
-            // stretched to fill an integer number of cell rows.
             let pad_w = ((raw_w + cell_w as u32 - 1) / cell_w as u32) * cell_w as u32;
             let pad_h = ((raw_h + cell_h as u32 - 1) / cell_h as u32) * cell_h as u32;
-            let png_data = if pad_w == raw_w && pad_h == raw_h {
-                png_data
-            } else {
-                use std::io::Write;
-                let mut child = match Command::new(imagemagick_cmd())
-                    .arg("PNG:-")
-                    .arg("-background")
-                    .arg("rgba(0,0,0,0)")
-                    .arg("-gravity")
-                    .arg("NorthWest")
-                    .arg("-extent")
-                    .arg(format!("{}x{}", pad_w, pad_h))
-                    .arg("PNG:-")
-                    .stdin(std::process::Stdio::piped())
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::null())
-                    .spawn() {
-                    Ok(c) => c,
-                    Err(_) => return false,
-                };
-                if let Some(mut stdin) = child.stdin.take() {
-                    let _ = stdin.write_all(&png_data);
-                }
-                match child.wait_with_output() {
-                    Ok(o) if !o.stdout.is_empty() => o.stdout,
-                    _ => return false,
-                }
-            };
-
-            // Cache the cell-aligned PNG (whether we just padded or
-            // it was already aligned). On revisit, the cached entry
-            // is ready to transmit: raw_w/raw_h reads from this PNG
-            // equal pad_w/pad_h, so the pad subprocess branch above
-            // is skipped. That's the difference between a snappy
-            // revisit and a slow one — and it also removes the most
-            // common silent-failure surface (a 2nd fork of `convert`
-            // for padding while the bg preconvert thread is forking
-            // too). Replaces the unpadded copy that the convert
-            // branch may have inserted earlier under the same key.
-            if let Ok(mut c) = self.png_cache.lock() {
-                c.insert(cache_key.clone(), png_data.clone());
-            }
 
             let img_pixel_w = pad_w;
             let img_pixel_h = pad_h;
