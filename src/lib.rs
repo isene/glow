@@ -38,6 +38,83 @@ pub fn new_png_cache() -> PngCache {
     std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()))
 }
 
+/// FNV-1a 64-bit hash. Used to turn a cache key (which is a path plus
+/// sizes plus mtime, e.g. `/home/u/x.jpg:800x600:1700000000`) into a
+/// filesystem-safe disk-cache filename.
+fn fnv1a64(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// Per-user on-disk PNG cache directory. Lives under
+/// `~/.kastrup/image_cache/` so it shares space with kastrup's own
+/// attachment cache. Phase 1 of the glow image speedup plan: cache
+/// PERSISTS across process restarts (the in-RAM `PngCache` is
+/// per-process and gets wiped on every kastrup launch).
+fn disk_cache_dir() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(std::path::PathBuf::from(home).join(".kastrup").join("image_cache"))
+}
+
+fn disk_cache_path(key: &str) -> Option<std::path::PathBuf> {
+    let dir = disk_cache_dir()?;
+    Some(dir.join(format!("{:016x}.png", fnv1a64(key))))
+}
+
+fn disk_cache_read(key: &str) -> Option<Vec<u8>> {
+    std::fs::read(disk_cache_path(key)?).ok()
+}
+
+fn disk_cache_write(key: &str, data: &[u8]) {
+    let Some(path) = disk_cache_path(key) else { return };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, data);
+}
+
+/// Two-tier cache get: RAM first, fall back to disk. On disk hit,
+/// populate RAM so the next lookup is fast. Returns owned `Vec<u8>`.
+fn cache_get(cache: &PngCache, key: &str) -> Option<Vec<u8>> {
+    if let Ok(c) = cache.lock() {
+        if let Some(v) = c.get(key) { return Some(v.clone()); }
+    }
+    let v = disk_cache_read(key)?;
+    if let Ok(mut c) = cache.lock() {
+        c.insert(key.to_string(), v.clone());
+    }
+    Some(v)
+}
+
+/// Two-tier cache contains: RAM-or-disk check used by the
+/// preconvert path to decide whether `convert` needs to run at all.
+fn cache_contains(cache: &PngCache, key: &str) -> bool {
+    if let Ok(c) = cache.lock() {
+        if c.contains_key(key) { return true; }
+    }
+    disk_cache_path(key).map(|p| p.exists()).unwrap_or(false)
+}
+
+/// Two-tier cache put: write to disk first (so a crash before the
+/// next get still leaves the bytes available), then insert into RAM.
+/// Caps RAM at 256 entries — disk has no soft cap (the user's image
+/// cache directory is theirs to prune).
+fn cache_put(cache: &PngCache, key: String, data: Vec<u8>) {
+    disk_cache_write(&key, &data);
+    if let Ok(mut c) = cache.lock() {
+        if c.len() >= 256 {
+            let to_drop: Vec<String> = c.keys().take(c.len().saturating_sub(200))
+                .cloned().collect();
+            for k in to_drop { c.remove(&k); }
+        }
+        c.insert(key, data);
+    }
+}
+
 /// Pre-convert images to PNG in background. Call from a spawned thread.
 /// Background-convert a list of images, store cell-aligned (padded)
 /// PNG output in `cache`. The padding step runs here so the
@@ -71,9 +148,10 @@ pub fn preconvert_images(
         let key = format!("{}:{}x{}:{}", path_str, pixel_width, pixel_height, mtime);
 
         // Skip if already cached (padded data — see insert below).
-        if let Ok(c) = cache.lock() {
-            if c.contains_key(&key) { continue; }
-        }
+        // Two-tier: in-RAM HashMap first, then on-disk PNG cache.
+        // After a kastrup restart, RAM is empty but disk usually has
+        // every recently-viewed image already converted.
+        if cache_contains(cache, &key) { continue; }
 
         // Resize.
         let output = Command::new(imagemagick_cmd())
@@ -127,19 +205,11 @@ pub fn preconvert_images(
             }
         };
 
-        if let Ok(mut c) = cache.lock() {
-            // Bigger cap (256 ≈ 256 MB worst-case for ~1 MB padded
-            // PNGs). When over, drop arbitrary entries down to 200
-            // — HashMap iter order is randomized so this is roughly
-            // random eviction, which is fine for an in-session cache
-            // where re-inserts on revisit keep hot entries alive.
-            if c.len() >= 256 {
-                let to_drop: Vec<String> = c.keys().take(c.len().saturating_sub(200))
-                    .cloned().collect();
-                for k in to_drop { c.remove(&k); }
-            }
-            c.insert(key, final_data);
-        }
+        // Two-tier put: write to disk so the next kastrup launch can
+        // reuse this padded PNG without re-running `convert`, AND
+        // populate RAM with the same data so the foreground show
+        // path is a single HashMap lookup away.
+        cache_put(cache, key, final_data);
     }
 }
 
@@ -335,10 +405,9 @@ impl Display {
             .unwrap_or_default()
             .as_millis() % 4294967295) as u32;
         let id = if id == 0 { 1 } else { id };
-        let png_data = if let Ok(c) = self.png_cache.lock() {
-            c.get(&cache_key).cloned()
-        } else { None };
-        let png_data = match png_data {
+        // Two-tier lookup: RAM, then on-disk PNG cache. Falls through
+        // to `convert` only when neither tier has the resized PNG.
+        let png_data = match cache_get(&self.png_cache, &cache_key) {
             Some(data) => data,
             None => {
                 let output = Command::new(imagemagick_cmd())
@@ -352,9 +421,7 @@ impl Display {
                     Ok(o) if !o.stdout.is_empty() => o.stdout,
                     _ => return None,
                 };
-                if let Ok(mut c) = self.png_cache.lock() {
-                    c.insert(cache_key.clone(), data.clone());
-                }
+                cache_put(&self.png_cache, cache_key.clone(), data.clone());
                 data
             }
         };
@@ -394,9 +461,7 @@ impl Display {
         // rationale). On revisit, the pad subprocess is skipped
         // because raw_w/raw_h read from this cached PNG already
         // equal pad_w/pad_h.
-        if let Ok(mut c) = self.png_cache.lock() {
-            c.insert(cache_key.clone(), png_data.clone());
-        }
+        cache_put(&self.png_cache, cache_key.clone(), png_data.clone());
         let img_pixel_w = pad_w as u16;
         let img_pixel_h = pad_h as u16;
         let encoded = base64::engine::general_purpose::STANDARD.encode(&png_data);
@@ -500,13 +565,12 @@ impl Display {
                 .as_millis() % 4294967295) as u32;
             let id = if id == 0 { 1 } else { id };
 
-            // Check pre-convert cache first (populated by background thread).
-            // Clone instead of remove so re-shows of the same image stay cheap.
-            let png_data = if let Ok(c) = self.png_cache.lock() {
-                c.get(&cache_key).cloned()
-            } else { None };
-
-            let png_data = match png_data {
+            // Two-tier cache: in-RAM first, fall back to the on-disk
+            // PNG cache populated by previous runs. Either path skips
+            // the `convert` subprocess entirely. The disk fallback is
+            // what makes the SECOND launch of kastrup show images
+            // instantly — RAM is empty on every new process.
+            let png_data = match cache_get(&self.png_cache, &cache_key) {
                 Some(data) => data,
                 None => {
                     // Fallback: convert synchronously
@@ -526,13 +590,10 @@ impl Display {
                         Ok(o) if !o.stdout.is_empty() => o.stdout,
                         _ => return false,
                     };
-                    // Populate png_cache so subsequent re-shows of the same
-                    // image (e.g. after a dir-watch reload) skip the convert
-                    // subprocess. Without this, every kitty placement that
-                    // gets cleared by clear() forces a fresh convert call.
-                    if let Ok(mut c) = self.png_cache.lock() {
-                        c.insert(cache_key.clone(), data.clone());
-                    }
+                    // Populate BOTH tiers so re-shows of the same image
+                    // (even across kastrup restarts) skip the convert
+                    // subprocess.
+                    cache_put(&self.png_cache, cache_key.clone(), data.clone());
                     data
                 }
             };
