@@ -77,6 +77,19 @@ fn disk_cache_write(key: &str, data: &[u8]) {
     let _ = std::fs::write(path, data);
 }
 
+/// Ensure `data` is persisted under `key`'s on-disk cache path.
+/// Returns true if the file is present afterwards (already-cached or
+/// just written). Returns false when the cache directory isn't
+/// available — caller falls back to chunked-base64 transmit.
+fn cache_put_to_disk(key: &str, data: &[u8]) -> bool {
+    let Some(path) = disk_cache_path(key) else { return false };
+    if path.exists() { return true; }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(&path, data).is_ok()
+}
+
 /// Two-tier cache get: RAM first, fall back to disk. On disk hit,
 /// populate RAM so the next lookup is fast. Returns owned `Vec<u8>`.
 fn cache_get(cache: &PngCache, key: &str) -> Option<Vec<u8>> {
@@ -755,19 +768,43 @@ impl Display {
             let img_pixel_w = pad_w;
             let img_pixel_h = pad_h;
 
-            // Encode and transmit in chunks
-            let encoded = base64::engine::general_purpose::STANDARD.encode(&png_data);
-            let chunks: Vec<&str> = encoded.as_bytes()
-                .chunks(4096)
-                .map(|c| std::str::from_utf8(c).unwrap_or(""))
-                .collect();
-
-            for (idx, chunk) in chunks.iter().enumerate() {
-                let more = if idx < chunks.len() - 1 { 1 } else { 0 };
-                if idx == 0 {
-                    print!("\x1b_Ga=t,f=100,i={},q=2,m={};{}\x1b\\", id, more, chunk);
-                } else {
-                    print!("\x1b_Gm={};{}\x1b\\", more, chunk);
+            // Transmit via file-path (`t=f`) when the disk cache is
+            // available. Kitty reads the file synchronously when it
+            // parses the APC sequence — no chunked base64, no
+            // transmit/place race. The chunked path below is a
+            // fallback for the (rare) case where the disk cache
+            // can't be located (e.g. no HOME env, read-only fs).
+            //
+            // This is the structural fix to the "image doesn't show
+            // until Enter" race that survived layers 1-4. Chunked
+            // transmit could leave place commands referencing data
+            // kitty hadn't finished assembling; one-shot file-path
+            // transmit makes that impossible by design.
+            let disk_path_for_transmit = if cache_put_to_disk(&cache_key, &png_data) {
+                disk_cache_path(&cache_key)
+            } else {
+                None
+            };
+            if let Some(p) = disk_path_for_transmit {
+                let path_bytes = p.to_string_lossy().into_owned();
+                let encoded_path = base64::engine::general_purpose::STANDARD
+                    .encode(path_bytes.as_bytes());
+                print!("\x1b_Ga=t,t=f,f=100,i={},q=2;{}\x1b\\",
+                    id, encoded_path);
+            } else {
+                // Fallback: chunked base64 transmit (legacy path).
+                let encoded = base64::engine::general_purpose::STANDARD.encode(&png_data);
+                let chunks: Vec<&str> = encoded.as_bytes()
+                    .chunks(4096)
+                    .map(|c| std::str::from_utf8(c).unwrap_or(""))
+                    .collect();
+                for (idx, chunk) in chunks.iter().enumerate() {
+                    let more = if idx < chunks.len() - 1 { 1 } else { 0 };
+                    if idx == 0 {
+                        print!("\x1b_Ga=t,f=100,i={},q=2,m={};{}\x1b\\", id, more, chunk);
+                    } else {
+                        print!("\x1b_Gm={};{}\x1b\\", more, chunk);
+                    }
                 }
             }
             io::stdout().flush().ok();
