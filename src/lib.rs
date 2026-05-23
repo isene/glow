@@ -299,11 +299,33 @@ pub fn preconvert_images(
     }
 }
 
+/// Seed for the per-Display id counter. Picked from the wall clock
+/// nanoseconds so two Display instances in the same process won't
+/// reuse each other's ids if one shuts down and another starts.
+/// Zero is never returned — kitty treats id=0 as "no id".
+fn seed_id() -> u32 {
+    let n = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u32)
+        .unwrap_or(1);
+    if n == 0 { 1 } else { n }
+}
+
 pub struct Display {
     protocol: Option<Protocol>,
     active_ids: Vec<u32>,
     image_cache: HashMap<String, (u32, u16, u16)>,  // (image_id, natural_pixel_w, natural_pixel_h)
     pub png_cache: PngCache,
+    /// Monotonic per-Display id allocator. Used instead of a
+    /// millisecond-timestamp so two rapid-fire kitty_display calls
+    /// can't end up with the same id. The previous
+    /// `SystemTime::now().as_millis() % 4G` formula produced
+    /// collisions on rapid j/k navigation in pointer; when the
+    /// fresh id happened to equal an `active_ids` entry, the
+    /// delete-before-place path wiped the data we'd just
+    /// transmitted, leaving a blank image until the user pressed
+    /// Enter (which forced a re-render under a different ms-tick).
+    next_id: u32,
 }
 
 impl Display {
@@ -315,6 +337,7 @@ impl Display {
             active_ids: Vec::new(),
             image_cache: HashMap::new(),
             png_cache: new_png_cache(),
+            next_id: seed_id(),
         }
     }
 
@@ -339,6 +362,19 @@ impl Display {
             active_ids: Vec::new(),
             image_cache: HashMap::new(),
             png_cache: new_png_cache(),
+            next_id: seed_id(),
+        }
+    }
+
+    /// Allocate a fresh kitty image id. Strictly monotonic per
+    /// Display, with a wrap that skips zero (kitty treats id=0 as
+    /// "no id"). Also skips ids currently in `active_ids` so a
+    /// brand-new transmit never collides with a live placement.
+    fn allocate_id(&mut self) -> u32 {
+        loop {
+            self.next_id = self.next_id.wrapping_add(1);
+            if self.next_id == 0 { self.next_id = 1; }
+            if !self.active_ids.contains(&self.next_id) { return self.next_id; }
         }
     }
 
@@ -486,11 +522,7 @@ impl Display {
         // earlier non-clipped sizes) — otherwise they ride the DEC
         // scroll region as ghosts.
         self.forget_path(image_path);
-        let id = (std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() % 4294967295) as u32;
-        let id = if id == 0 { 1 } else { id };
+        let id = self.allocate_id();
         // Two-tier lookup: RAM, then on-disk PNG cache. Falls through
         // to `convert` only when neither tier has the resized PNG.
         let png_data = match cache_get(&self.png_cache, &cache_key) {
@@ -644,12 +676,7 @@ impl Display {
             // delete below is a no-op for those stale ids and they keep
             // riding the DEC scroll region as ghost duplicates.
             self.forget_path(image_path);
-            // Generate new ID
-            let id = (std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() % 4294967295) as u32;
-            let id = if id == 0 { 1 } else { id };
+            let id = self.allocate_id();
 
             // Two-tier cache: in-RAM first, fall back to the on-disk
             // PNG cache populated by previous runs. Either path skips
