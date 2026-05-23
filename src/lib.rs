@@ -808,8 +808,18 @@ impl Display {
         // and kitty doesn't stretch.
         let cols = (nat_pixel_w as u32 / cell_w as u32).max(1) as u16;
         let rows = (nat_pixel_h as u32 / cell_h as u32).max(1) as u16;
-        print!("\x1b_Ga=p,i={},c={},r={},z=1,q=2,C=1\x1b\\",
+        let place = format!("\x1b_Ga=p,i={},c={},r={},z=1,q=2,C=1\x1b\\",
             image_id, cols, rows);
+        // Double-tap the place command. On rapid navigation (pointer's
+        // j/k through an image directory), kitty occasionally drops
+        // the first place silently — the chunked transmit hasn't
+        // finished assembling server-side when the place arrives, so
+        // it references data that isn't yet ready. The second place,
+        // emitted right after, lands after kitty has processed the
+        // transmit chunks and lights up the placement. Cheap
+        // insurance: ~30 extra bytes per show, idempotent if the
+        // first placement actually succeeded.
+        print!("{}{}", place, place);
         io::stdout().flush().ok();
 
         if !already_placed {
