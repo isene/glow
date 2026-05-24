@@ -312,6 +312,30 @@ pub fn preconvert_images(
     }
 }
 
+/// RAII guard for DECSET 2026 (Synchronized Output Mode). Emits
+/// `\x1b[?2026h` on construction and `\x1b[?2026l` on Drop. Use to
+/// wrap any multi-write graphics sequence so the terminal renders
+/// it as a single atomic frame.
+///
+/// The Drop is critical: glow's kitty_display has early-return
+/// paths (cache miss + decode failure, etc.). Without the Drop the
+/// closing `2026l` would be skipped on those paths and the terminal
+/// would stay in sync mode — no further output would render until
+/// the next `2026l` from somewhere else.
+struct SyncOutput;
+impl SyncOutput {
+    fn begin() -> Self {
+        print!("\x1b[?2026h");
+        Self
+    }
+}
+impl Drop for SyncOutput {
+    fn drop(&mut self) {
+        print!("\x1b[?2026l");
+        io::stdout().flush().ok();
+    }
+}
+
 /// Seed for the per-Display id counter. Picked from the wall clock
 /// nanoseconds so two Display instances in the same process won't
 /// reuse each other's ids if one shuts down and another starts.
@@ -658,6 +682,20 @@ impl Display {
             return false;
         }
 
+        // Wrap the entire transmit + place sequence in DECSET 2026
+        // (Synchronized Output). The terminal buffers everything
+        // between `\x1b[?2026h` and `\x1b[?2026l` and renders once
+        // at the close, so neighbour text refreshes can't briefly
+        // occlude the placement and there's no in-between frame
+        // where the new image is partially placed.
+        //
+        // Drop guard ensures the closing `2026l` always fires —
+        // including the cache-miss-and-decode-fails early returns
+        // below. Without the guard those paths would leave the
+        // terminal in sync mode forever (no further output would
+        // render until the next 2026l from somewhere).
+        let _sync = SyncOutput::begin();
+
         let pixel_w = max_width as u32 * cell_w as u32;
         let pixel_h = max_height as u32 * cell_h as u32;
 
@@ -768,43 +806,21 @@ impl Display {
             let img_pixel_w = pad_w;
             let img_pixel_h = pad_h;
 
-            // Transmit via file-path (`t=f`) when the disk cache is
-            // available. Kitty reads the file synchronously when it
-            // parses the APC sequence — no chunked base64, no
-            // transmit/place race. The chunked path below is a
-            // fallback for the (rare) case where the disk cache
-            // can't be located (e.g. no HOME env, read-only fs).
-            //
-            // This is the structural fix to the "image doesn't show
-            // until Enter" race that survived layers 1-4. Chunked
-            // transmit could leave place commands referencing data
-            // kitty hadn't finished assembling; one-shot file-path
-            // transmit makes that impossible by design.
-            let disk_path_for_transmit = if cache_put_to_disk(&cache_key, &png_data) {
-                disk_cache_path(&cache_key)
-            } else {
-                None
-            };
-            if let Some(p) = disk_path_for_transmit {
-                let path_bytes = p.to_string_lossy().into_owned();
-                let encoded_path = base64::engine::general_purpose::STANDARD
-                    .encode(path_bytes.as_bytes());
-                print!("\x1b_Ga=t,t=f,f=100,i={},q=2;{}\x1b\\",
-                    id, encoded_path);
-            } else {
-                // Fallback: chunked base64 transmit (legacy path).
-                let encoded = base64::engine::general_purpose::STANDARD.encode(&png_data);
-                let chunks: Vec<&str> = encoded.as_bytes()
-                    .chunks(4096)
-                    .map(|c| std::str::from_utf8(c).unwrap_or(""))
-                    .collect();
-                for (idx, chunk) in chunks.iter().enumerate() {
-                    let more = if idx < chunks.len() - 1 { 1 } else { 0 };
-                    if idx == 0 {
-                        print!("\x1b_Ga=t,f=100,i={},q=2,m={};{}\x1b\\", id, more, chunk);
-                    } else {
-                        print!("\x1b_Gm={};{}\x1b\\", more, chunk);
-                    }
+            // Chunked base64 transmit (legacy path, known-working).
+            // The t=f / file-path transmit attempted in v0.1.17 broke
+            // image display entirely — under investigation. Keep this
+            // path until we've verified t=f works flawlessly.
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&png_data);
+            let chunks: Vec<&str> = encoded.as_bytes()
+                .chunks(4096)
+                .map(|c| std::str::from_utf8(c).unwrap_or(""))
+                .collect();
+            for (idx, chunk) in chunks.iter().enumerate() {
+                let more = if idx < chunks.len() - 1 { 1 } else { 0 };
+                if idx == 0 {
+                    print!("\x1b_Ga=t,f=100,i={},q=2,m={};{}\x1b\\", id, more, chunk);
+                } else {
+                    print!("\x1b_Gm={};{}\x1b\\", more, chunk);
                 }
             }
             io::stdout().flush().ok();
