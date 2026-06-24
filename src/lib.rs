@@ -77,19 +77,6 @@ fn disk_cache_write(key: &str, data: &[u8]) {
     let _ = std::fs::write(path, data);
 }
 
-/// Ensure `data` is persisted under `key`'s on-disk cache path.
-/// Returns true if the file is present afterwards (already-cached or
-/// just written). Returns false when the cache directory isn't
-/// available — caller falls back to chunked-base64 transmit.
-fn cache_put_to_disk(key: &str, data: &[u8]) -> bool {
-    let Some(path) = disk_cache_path(key) else { return false };
-    if path.exists() { return true; }
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    std::fs::write(&path, data).is_ok()
-}
-
 /// Two-tier cache get: RAM first, fall back to disk. On disk hit,
 /// populate RAM so the next lookup is fast. Returns owned `Vec<u8>`.
 fn cache_get(cache: &PngCache, key: &str) -> Option<Vec<u8>> {
@@ -1011,32 +998,6 @@ fn chafa_display(image_path: &str, x: u16, y: u16, max_width: u16, max_height: u
 }
 
 // --- Protocol detection ---
-
-/// Drain kitty graphics protocol responses from stdin.
-/// Kitty sends back "\x1b_Gi=ID;OK\x1b\\" after receiving image data.
-/// These must be consumed to prevent them from leaking into the input stream.
-fn drain_kitty_responses() {
-    use std::io::Read;
-    // Small delay to let the terminal send its response
-    std::thread::sleep(std::time::Duration::from_millis(10));
-    // Read and discard any pending stdin data (non-blocking)
-    #[cfg(unix)]
-    {
-        use std::os::unix::io::AsRawFd;
-        let fd = std::io::stdin().as_raw_fd();
-        let mut buf = [0u8; 1024];
-        unsafe {
-            // Get current flags
-            let flags = libc::fcntl(fd, libc::F_GETFL);
-            // Set non-blocking
-            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-            // Read and discard
-            while libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) > 0 {}
-            // Restore blocking mode
-            libc::fcntl(fd, libc::F_SETFL, flags);
-        }
-    }
-}
 
 fn detect_protocol() -> Option<Protocol> {
     // Kitty
