@@ -29,6 +29,11 @@ pub enum Protocol {
     /// dependency beyond `convert`. Works over SSH, in tmux without
     /// passthrough, and on every terminal that can render Unicode.
     Braille,
+    /// Plain-ASCII fallback: one `" .:-=+*#%@"`-ramp glyph per cell.
+    /// The lowest common denominator — the Linux virtual console
+    /// (`TERM=linux`) has no braille block (`U+2800`) in its font, so
+    /// Braille renders blank there; ASCII always shows. `convert` only.
+    Ascii,
 }
 
 /// Pre-converted PNG data cache, shareable across threads.
@@ -370,8 +375,16 @@ impl Display {
     /// graphics-free preview over SSH or in tmux without passthrough.
     pub fn with_mode(mode: &str) -> Self {
         let protocol = match mode {
-            "ascii" | "chafa" => {
+            "chafa" => {
                 if command_exists("chafa") { Some(Protocol::Chafa) } else { None }
+            }
+            "ascii" => {
+                // Prefer chafa's richer output; fall back to the plain-ASCII
+                // ramp (convert) so "ascii" still works on the Linux console
+                // where chafa isn't installed.
+                if command_exists("chafa") { Some(Protocol::Chafa) }
+                else if command_exists(imagemagick_cmd()) { Some(Protocol::Ascii) }
+                else { None }
             }
             "kitty" => Some(Protocol::Kitty),
             "sixel" => Some(Protocol::Sixel),
@@ -428,6 +441,7 @@ impl Display {
             Protocol::W3m => w3m_display(image_path, x, y, max_width, max_height),
             Protocol::Chafa => chafa_display(image_path, x, y, max_width, max_height),
             Protocol::Braille => braille_display(image_path, x, y, max_width, max_height),
+            Protocol::Ascii => ascii_display(image_path, x, y, max_width, max_height),
         }
     }
 
@@ -510,6 +524,9 @@ impl Display {
             }
             Some(Protocol::Braille) => {
                 // Braille is text-based, cleared by terminal redraw
+            }
+            Some(Protocol::Ascii) => {
+                // ASCII is text-based, cleared by terminal redraw
             }
             None => {}
         }
@@ -1019,8 +1036,13 @@ fn detect_protocol() -> Option<Protocol> {
         }
     }
 
-    // W3m fallback
-    if Path::new("/usr/lib/w3m/w3mimgdisplay").exists() {
+    // W3m fallback — draws into an X11 window, so it is useless without a
+    // running display. In a bare TTY (`DISPLAY`/`WAYLAND_DISPLAY` unset) the
+    // helper binaries can still be installed; detecting W3m there swallows
+    // the text fallbacks below and shows NOTHING. Gate on a live display.
+    let has_display = std::env::var_os("DISPLAY").is_some()
+        || std::env::var_os("WAYLAND_DISPLAY").is_some();
+    if has_display && Path::new("/usr/lib/w3m/w3mimgdisplay").exists() {
         if command_exists("xwininfo") && command_exists("xdotool") && command_exists("identify") {
             return Some(Protocol::W3m);
         }
@@ -1031,10 +1053,15 @@ fn detect_protocol() -> Option<Protocol> {
         return Some(Protocol::Chafa);
     }
 
-    // Braille fallback — last resort, always works as long as `convert` is
-    // available. Pure-text output, so survives SSH, tmux without
-    // passthrough, weird terminals, etc.
+    // Text fallback via ImageMagick — last resort, no protocol support
+    // needed. Braille packs 2×4 dots per cell but needs a font with the
+    // U+2800 block; the Linux console (`TERM=linux`) lacks it and renders
+    // braille blank, so use the plain-ASCII ramp there. Everywhere else
+    // (xterm, kitty, glass, tmux, SSH) braille looks far better.
     if command_exists(imagemagick_cmd()) {
+        if std::env::var("TERM").unwrap_or_default() == "linux" {
+            return Some(Protocol::Ascii);
+        }
         return Some(Protocol::Braille);
     }
 
@@ -1142,6 +1169,76 @@ fn braille_display(path: &str, x: u16, y: u16, max_width: u16, max_height: u16) 
             } else {
                 out.push(' ');
             }
+        }
+    }
+    let _ = io::stdout().write_all(out.as_bytes());
+    let _ = io::stdout().flush();
+    true
+}
+
+/// Plain-ASCII fallback renderer. Maps image luminance to a 10-level ramp,
+/// one character per terminal cell, positioned with cursor moves. No color
+/// (the Linux console has no truecolor) and no special glyphs, so it renders
+/// on any font — including the sparse Linux virtual-console font where
+/// braille shows blank. `convert`/`magick` only.
+fn ascii_display(path: &str, x: u16, y: u16, max_width: u16, max_height: u16) -> bool {
+    if max_width == 0 || max_height == 0 { return false; }
+
+    // Original pixel dims (for aspect-preserving fit).
+    let info = Command::new(imagemagick_cmd())
+        .arg(format!("{}[0]", path))
+        .arg("-format").arg("%w %h")
+        .arg("info:-")
+        .output();
+    let (orig_w, orig_h) = match info {
+        Ok(o) if !o.stdout.is_empty() => {
+            let s = String::from_utf8_lossy(&o.stdout);
+            let mut it = s.split_whitespace();
+            let w: u32 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let h: u32 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            (w, h)
+        }
+        _ => return false,
+    };
+    if orig_w == 0 || orig_h == 0 { return false; }
+
+    // One glyph per cell. A cell is ~2× taller than wide, so halve the row
+    // count relative to square sampling to keep the image's aspect ratio.
+    let mut cells_w = max_width as u32;
+    let mut cells_h = ((cells_w * orig_h) as f64 / (orig_w as f64 * 2.0)).round() as u32;
+    if cells_h > max_height as u32 {
+        cells_h = max_height as u32;
+        cells_w = ((cells_h * 2 * orig_w) as f64 / orig_h as f64).round() as u32;
+    }
+    cells_w = cells_w.clamp(1, max_width as u32);
+    cells_h = cells_h.clamp(1, max_height as u32);
+
+    // Grayscale, one byte per pixel, exactly cells_w × cells_h.
+    let raw = Command::new(imagemagick_cmd())
+        .arg(format!("{}[0]", path))
+        .arg("-auto-orient")
+        .arg("-resize").arg(format!("{}x{}!", cells_w, cells_h))
+        .arg("-colorspace").arg("Gray")
+        .arg("-depth").arg("8")
+        .arg("GRAY:-")
+        .output();
+    let bytes = match raw {
+        Ok(o) if o.stdout.len() == (cells_w as usize) * (cells_h as usize) => o.stdout,
+        _ => return false,
+    };
+
+    // Dark → light. Space for the darkest, dense glyph for the brightest, so
+    // on the console's black background more light reads as more ink.
+    const RAMP: &[u8] = b" .:-=+*#%@";
+    let last = (RAMP.len() - 1) as u32;
+
+    let mut out = String::with_capacity((cells_w as usize + 8) * cells_h as usize);
+    for cy in 0..cells_h {
+        out.push_str(&format!("\x1b[{};{}H", y as u32 + cy, x));
+        for cx in 0..cells_w {
+            let lum = bytes[(cy * cells_w + cx) as usize] as u32;
+            let idx = (lum * last / 255) as usize;
+            out.push(RAMP[idx] as char);
         }
     }
     let _ = io::stdout().write_all(out.as_bytes());
