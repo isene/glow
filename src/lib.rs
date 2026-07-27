@@ -502,6 +502,23 @@ impl Display {
     }
 
     /// Clear all displayed images
+    /// Delete every placement the terminal is holding, ours or not, and
+    /// forget our own bookkeeping.
+    ///
+    /// `clear` deletes the ids we think are on screen; this asks the
+    /// terminal to drop them all. Use it on the way out: an app that
+    /// exits with a stale id, or that never got to track one, otherwise
+    /// leaves images painted over the user's shell — and once the process
+    /// is gone nothing can clean them up.
+    pub fn clear_all(&mut self) {
+        if matches!(self.protocol, Some(Protocol::Kitty)) {
+            // d=a: delete all placements, keep the transmitted data.
+            print!("\x1b_Ga=d,d=a,q=2\x1b\\");
+            io::stdout().flush().ok();
+        }
+        self.active_ids.clear();
+    }
+
     pub fn clear(&mut self, x: u16, y: u16, width: u16, height: u16, term_width: u16, term_height: u16) {
         match self.protocol {
             Some(Protocol::Kitty) => {
