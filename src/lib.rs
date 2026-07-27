@@ -893,9 +893,11 @@ fn sixel_display(image_path: &str, x: u16, y: u16, max_width: u16, max_height: u
     let pixel_h = max_height as u32 * 20;
     print!("\x1b[{};{}H", y, x);
     io::stdout().flush().ok();
-    let escaped = shell_escape(image_path);
+    // No shell here: Command passes argv straight to execve, so a
+    // shell-quoted path would arrive with its quotes as part of the name
+    // ("no decode delegate for `'/path/x.png''").
     Command::new(imagemagick_cmd())
-        .arg(&escaped)
+        .arg(image_path)
         .arg("-resize")
         .arg(format!("{}x{}\\>", pixel_w, pixel_h))
         .arg("sixel:-")
@@ -918,12 +920,11 @@ fn w3m_display(image_path: &str, x: u16, y: u16, max_width: u16, max_height: u16
     let img_max_w = char_w * max_width as u32;
     let img_max_h = char_h * max_height as u32;
 
-    // Get image dimensions
-    let escaped = shell_escape(image_path);
+    // Get image dimensions (raw path: no shell in the way, see above)
     let dims = Command::new("identify")
         .arg("-format")
         .arg("%wx%h")
-        .arg(format!("{}[0]", escaped))
+        .arg(format!("{}[0]", image_path))
         .output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
@@ -1336,6 +1337,4 @@ fn get_terminal_pixel_size() -> (u32, u32, u32, u32) {
     (w, h, cols, rows)
 }
 
-fn shell_escape(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
+
