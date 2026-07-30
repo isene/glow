@@ -23,6 +23,11 @@ pub enum Protocol {
     Sixel,
     W3m,
     Chafa,
+    /// Two pixels per cell: `▀` with the top half in the foreground
+    /// colour and the bottom in the background. Needs truecolour and
+    /// nothing else — no external program, no graphics protocol. The
+    /// best-looking fallback for photographs, and the default one.
+    HalfBlock,
     /// Universal text fallback: render the image into Unicode braille
     /// glyphs (`U+2800`–`U+28FF`). Each cell holds a 2×4 dot grid, so a
     /// W×H char block yields a (2W)×(4H) "pixel" image. No external
@@ -370,27 +375,28 @@ impl Display {
         }
     }
 
-    /// Force a specific display mode ("auto", "ascii", "off", "kitty",
-    /// "sixel", "braille"). "braille" needs `convert` only — useful as a
-    /// graphics-free preview over SSH or in tmux without passthrough.
+    /// Force a specific display mode ("auto", "halfblock", "braille",
+    /// "ascii", "chafa", "kitty", "sixel", "off"). The text modes need no
+    /// graphics protocol, which makes them the way to show a picture over
+    /// SSH or in tmux without passthrough.
     pub fn with_mode(mode: &str) -> Self {
         let protocol = match mode {
             "chafa" => {
                 if command_exists("chafa") { Some(Protocol::Chafa) } else { None }
             }
-            "ascii" => {
-                // Prefer chafa's richer output; fall back to the plain-ASCII
-                // ramp (convert) so "ascii" still works on the Linux console
-                // where chafa isn't installed.
-                if command_exists("chafa") { Some(Protocol::Chafa) }
+            "ascii" | "text" => {
+                // Best text rendering available: two colours per cell if
+                // the terminal has truecolour, then chafa, then the plain
+                // ramp, which is all the Linux console can take.
+                if truecolor() { Some(Protocol::HalfBlock) }
+                else if command_exists("chafa") { Some(Protocol::Chafa) }
                 else if command_exists(imagemagick_cmd()) { Some(Protocol::Ascii) }
                 else { None }
             }
+            "halfblock" | "half" | "blocks" => Some(Protocol::HalfBlock),
             "kitty" => Some(Protocol::Kitty),
             "sixel" => Some(Protocol::Sixel),
-            "braille" => {
-                if command_exists(imagemagick_cmd()) { Some(Protocol::Braille) } else { None }
-            }
+            "braille" => Some(Protocol::Braille),
             "off" | "none" => None,
             _ => detect_protocol(), // "auto"
         };
@@ -440,6 +446,7 @@ impl Display {
             Protocol::Sixel => sixel_display(image_path, x, y, max_width, max_height),
             Protocol::W3m => w3m_display(image_path, x, y, max_width, max_height),
             Protocol::Chafa => chafa_display(image_path, x, y, max_width, max_height),
+            Protocol::HalfBlock => half_block_display(image_path, x, y, max_width, max_height),
             Protocol::Braille => braille_display(image_path, x, y, max_width, max_height),
             Protocol::Ascii => ascii_display(image_path, x, y, max_width, max_height),
         }
@@ -539,8 +546,8 @@ impl Display {
             Some(Protocol::Chafa) => {
                 // Chafa is text-based, cleared by terminal redraw
             }
-            Some(Protocol::Braille) => {
-                // Braille is text-based, cleared by terminal redraw
+            Some(Protocol::HalfBlock) | Some(Protocol::Braille) => {
+                // Both are text, cleared by the terminal's own redraw
             }
             Some(Protocol::Ascii) => {
                 // ASCII is text-based, cleared by terminal redraw
@@ -1066,132 +1073,377 @@ fn detect_protocol() -> Option<Protocol> {
         }
     }
 
-    // Chafa ASCII art fallback (works in any terminal)
+    // Text fallbacks, in order of how good they look.
+    //
+    // Half blocks come first: two full-colour pixels per cell, decoded
+    // and scaled in this process, so no fork per image and nothing to
+    // install. Then chafa, which is a fork but knows more glyphs than we
+    // do. Then braille, which packs 2×4 dots into one colour. The Linux
+    // console has neither truecolour nor a U+2800 block in its font, so
+    // it gets the plain ramp.
+    if truecolor() {
+        return Some(Protocol::HalfBlock);
+    }
     if command_exists("chafa") {
         return Some(Protocol::Chafa);
     }
-
-    // Text fallback via ImageMagick — last resort, no protocol support
-    // needed. Braille packs 2×4 dots per cell but needs a font with the
-    // U+2800 block; the Linux console (`TERM=linux`) lacks it and renders
-    // braille blank, so use the plain-ASCII ramp there. Everywhere else
-    // (xterm, kitty, glass, tmux, SSH) braille looks far better.
-    if command_exists(imagemagick_cmd()) {
-        if std::env::var("TERM").unwrap_or_default() == "linux" {
-            return Some(Protocol::Ascii);
-        }
-        return Some(Protocol::Braille);
+    if std::env::var("TERM").unwrap_or_default() == "linux" {
+        return Some(Protocol::Ascii);
     }
-
-    None
+    Some(Protocol::Braille)
 }
 
-/// Render `path` into Unicode braille glyphs at (x, y), fitting within
-/// `max_width` × `max_height` character cells. Each cell is 2×4 dots, so the
-/// effective pixel resolution is (2·max_width) × (4·max_height). Each glyph
-/// gets the average color of its 8 source pixels via SGR truecolor — works
-/// in every modern terminal that handles 24-bit color.
-///
-/// Pipeline: `convert` resizes the image (preserving aspect, snapping the
-/// fit dims down to multiples of 2×4 so the dot grid tiles cleanly), then
-/// dumps raw RGBA. We walk 2×4 blocks: each pixel above the brightness
-/// threshold sets one dot, the cell color is the mean of the lit pixels.
-fn braille_display(path: &str, x: u16, y: u16, max_width: u16, max_height: u16) -> bool {
-    if max_width == 0 || max_height == 0 { return false; }
+/// Does this terminal take 24-bit colour? The half-block renderer is
+/// pointless without it, and every terminal that has it says so.
+fn truecolor() -> bool {
+    let ct = std::env::var("COLORTERM").unwrap_or_default();
+    if ct.contains("truecolor") || ct.contains("24bit") {
+        return true;
+    }
+    let term = std::env::var("TERM").unwrap_or_default();
+    term.contains("kitty") || term.contains("direct") || term.contains("alacritty")
+}
 
-    // Original pixel dims (for aspect-preserving fit).
+// --- Shared pixel sampling for the text fallbacks ---
+
+/// sRGB byte to linear light, scaled to 0..65535. Averaging pixels in
+/// this space is what keeps a shrunken image at the brightness it
+/// started with: sRGB values are perceptual, and adding them directly
+/// makes every downscale come out dark.
+fn srgb_to_linear() -> &'static [u32; 256] {
+    static LUT: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
+    LUT.get_or_init(|| {
+        let mut t = [0u32; 256];
+        for (i, slot) in t.iter_mut().enumerate() {
+            let c = i as f64 / 255.0;
+            let lin = if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) };
+            *slot = (lin * 65535.0).round() as u32;
+        }
+        t
+    })
+}
+
+/// And back again, from 0..65535 linear to an sRGB byte. One entry per
+/// linear step (64 KB, built once on first use): a coarser table rounds
+/// the darkest few values to zero, and dark detail is exactly where the
+/// eye notices.
+fn linear_to_srgb(v: u32) -> u8 {
+    static LUT: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    let lut = LUT.get_or_init(|| {
+        (0..=65535u32)
+            .map(|i| {
+                let lin = i as f64 / 65535.0;
+                let c = if lin <= 0.0031308 {
+                    lin * 12.92
+                } else {
+                    1.055 * lin.powf(1.0 / 2.4) - 0.055
+                };
+                (c * 255.0).round().clamp(0.0, 255.0) as u8
+            })
+            .collect()
+    });
+    lut[v.min(65535) as usize]
+}
+
+/// Decode `path` and box-average it down to at most `max_w` × `max_h`
+/// pixels, keeping the aspect ratio. Returns `(w, h, RGBA8)`.
+///
+/// The averaging happens in linear light, so a checkerboard of black and
+/// white shrinks to the grey it physically is rather than the darker one
+/// that adding sRGB bytes would give.
+fn pixel_grid(path: &str, max_w: u32, max_h: u32) -> Option<(u32, u32, Vec<u8>)> {
+    if max_w == 0 || max_h == 0 {
+        return None;
+    }
+    match pixel_grid_native(path, max_w, max_h) {
+        Some(g) => Some(g),
+        // HEIC, SVG, odd CMYK JPEGs: whatever the `image` crate will not
+        // decode, ImageMagick still can.
+        None => pixel_grid_magick(path, max_w, max_h),
+    }
+}
+
+/// The dimensions an image of `sw` × `sh` takes inside the box, with
+/// square pixels.
+fn fit_within(sw: u32, sh: u32, max_w: u32, max_h: u32) -> (u32, u32) {
+    let scale = (max_w as f64 / sw as f64).min(max_h as f64 / sh as f64);
+    (
+        ((sw as f64 * scale).round() as u32).clamp(1, max_w),
+        ((sh as f64 * scale).round() as u32).clamp(1, max_h),
+    )
+}
+
+fn pixel_grid_native(path: &str, max_w: u32, max_h: u32) -> Option<(u32, u32, Vec<u8>)> {
+    use image::ImageReader;
+    let img = ImageReader::open(path).ok()?.with_guessed_format().ok()?.decode().ok()?;
+    let src = img.to_rgba8();
+    let (sw, sh) = (src.width(), src.height());
+    if sw == 0 || sh == 0 {
+        return None;
+    }
+    let (tw, th) = fit_within(sw, sh, max_w, max_h);
+    Some((tw, th, box_average(src.as_raw(), sw, sh, tw, th)))
+}
+
+/// Average each target pixel over the source rectangle it covers, in
+/// linear light, weighting colour by alpha so transparent pixels do not
+/// bleed their colour into their neighbours. Upscaling falls back to
+/// picking the nearest source pixel.
+fn box_average(src: &[u8], sw: u32, sh: u32, tw: u32, th: u32) -> Vec<u8> {
+    let lin = srgb_to_linear();
+    let mut out = vec![0u8; (tw * th * 4) as usize];
+    for ty in 0..th {
+        let y0 = (ty as u64 * sh as u64 / th as u64) as u32;
+        let y1 = (((ty + 1) as u64 * sh as u64 / th as u64) as u32).max(y0 + 1).min(sh);
+        for tx in 0..tw {
+            let x0 = (tx as u64 * sw as u64 / tw as u64) as u32;
+            let x1 = (((tx + 1) as u64 * sw as u64 / tw as u64) as u32).max(x0 + 1).min(sw);
+            let (mut r, mut g, mut b, mut a, mut aw) = (0u64, 0u64, 0u64, 0u64, 0u64);
+            let mut n = 0u64;
+            for sy in y0..y1 {
+                let row = (sy * sw * 4) as usize;
+                for sx in x0..x1 {
+                    let i = row + (sx * 4) as usize;
+                    let al = src[i + 3] as u64;
+                    r += lin[src[i] as usize] as u64 * al;
+                    g += lin[src[i + 1] as usize] as u64 * al;
+                    b += lin[src[i + 2] as usize] as u64 * al;
+                    a += al;
+                    aw += al;
+                    n += 1;
+                }
+            }
+            let o = ((ty * tw + tx) * 4) as usize;
+            if aw == 0 || n == 0 {
+                out[o + 3] = 0;
+                continue;
+            }
+            out[o] = linear_to_srgb((r / aw) as u32);
+            out[o + 1] = linear_to_srgb((g / aw) as u32);
+            out[o + 2] = linear_to_srgb((b / aw) as u32);
+            out[o + 3] = (a / n) as u8;
+        }
+    }
+    out
+}
+
+/// The same, through ImageMagick, for formats the Rust decoder does not
+/// know. `-colorspace RGB` before the resize and back after is IM's way
+/// of saying "average in linear light".
+fn pixel_grid_magick(path: &str, max_w: u32, max_h: u32) -> Option<(u32, u32, Vec<u8>)> {
     let info = Command::new(imagemagick_cmd())
         .arg(format!("{}[0]", path))
         .arg("-format").arg("%w %h")
         .arg("info:-")
-        .output();
-    let (orig_w, orig_h) = match info {
-        Ok(o) if !o.stdout.is_empty() => {
-            let s = String::from_utf8_lossy(&o.stdout);
-            let mut it = s.split_whitespace();
-            let w: u32 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-            let h: u32 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-            (w, h)
-        }
-        _ => return false,
-    };
-    if orig_w == 0 || orig_h == 0 { return false; }
-
-    let target_px_w = (max_width as u32) * 2;
-    let target_px_h = (max_height as u32) * 4;
-    let scale = (target_px_w as f64 / orig_w as f64)
-        .min(target_px_h as f64 / orig_h as f64);
-    let mut fit_w = (orig_w as f64 * scale).round().max(2.0) as u32;
-    let mut fit_h = (orig_h as f64 * scale).round().max(4.0) as u32;
-    // Snap down to multiples of 2×4 so the braille grid tiles cleanly.
-    fit_w -= fit_w % 2;
-    fit_h -= fit_h % 4;
-    if fit_w < 2 || fit_h < 4 { return false; }
-
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&info.stdout);
+    let mut it = s.split_whitespace();
+    let sw: u32 = it.next()?.parse().ok()?;
+    let sh: u32 = it.next()?.parse().ok()?;
+    if sw == 0 || sh == 0 {
+        return None;
+    }
+    let (tw, th) = fit_within(sw, sh, max_w, max_h);
     let raw = Command::new(imagemagick_cmd())
         .arg(format!("{}[0]", path))
         .arg("-auto-orient")
-        .arg("-resize").arg(format!("{}x{}!", fit_w, fit_h))
+        .arg("-colorspace").arg("RGB")
+        .arg("-resize").arg(format!("{}x{}!", tw, th))
+        .arg("-colorspace").arg("sRGB")
         .arg("-depth").arg("8")
         .arg("RGBA:-")
-        .output();
-    let bytes = match raw {
-        Ok(o) if o.stdout.len() == (fit_w as usize) * (fit_h as usize) * 4 => o.stdout,
-        _ => return false,
+        .output()
+        .ok()?;
+    if raw.stdout.len() != (tw * th * 4) as usize {
+        return None;
+    }
+    Some((tw, th, raw.stdout))
+}
+
+/// A 4×2 ordered dither, as thresholds on 0..255. Used to turn a smooth
+/// image into braille dots without losing the mid-tones a fixed
+/// threshold throws away.
+const BAYER_4X2: [[u8; 2]; 4] = [[16, 144], [208, 80], [48, 176], [240, 112]];
+
+/// Perceptual brightness, the usual green-heavy weights.
+fn luma(r: u8, g: u8, b: u8) -> u8 {
+    ((r as u32 * 77 + g as u32 * 150 + b as u32 * 29) >> 8) as u8
+}
+
+/// Render `path` with half-block glyphs at (x, y), fitting within
+/// `max_width` × `max_height` cells.
+///
+/// A cell gets `▀`: the foreground colour paints the top half, the
+/// background the bottom. That is two full-colour pixels per cell, and
+/// since a cell is about twice as tall as it is wide, both come out
+/// square. It is the best a terminal can do without a graphics protocol,
+/// and it needs no external program at all.
+fn half_block_display(path: &str, x: u16, y: u16, max_width: u16, max_height: u16) -> bool {
+    let (w, h, px) = match pixel_grid(path, max_width as u32, max_height as u32 * 2) {
+        Some(g) => g,
+        None => return false,
+    };
+    let out = half_block_frame(w, h, &px, x, y);
+    let _ = io::stdout().write_all(out.as_bytes());
+    let _ = io::stdout().flush();
+    true
+}
+
+/// The escape sequence for a half-block frame, built whole so it can be
+/// written in one go (and checked in a test).
+fn half_block_frame(w: u32, h: u32, px: &[u8], x: u16, y: u16) -> String {
+    let rows = h.div_ceil(2);
+    let at = |cx: u32, cy: u32| -> Option<(u8, u8, u8)> {
+        if cy >= h {
+            return None;
+        }
+        let i = ((cy * w + cx) * 4) as usize;
+        // Anything close to transparent shows the terminal through.
+        if px[i + 3] < 64 { None } else { Some((px[i], px[i + 1], px[i + 2])) }
     };
 
-    let cells_w = (fit_w / 2) as u16;
-    let cells_h = (fit_h / 4) as u16;
-    // Braille dot bit values — column-major, top to bottom:
-    //   col 0 row 0 = 0x01   col 1 row 0 = 0x08
-    //   col 0 row 1 = 0x02   col 1 row 1 = 0x10
-    //   col 0 row 2 = 0x04   col 1 row 2 = 0x20
-    //   col 0 row 3 = 0x40   col 1 row 3 = 0x80
+    let mut out = String::with_capacity((w * rows) as usize * 24);
+    for ry in 0..rows {
+        out.push_str(&format!("\x1b[{};{}H", y as u32 + ry, x));
+        // Colours are only re-sent when they change: a photo with large
+        // flat areas emits a fraction of the bytes it otherwise would.
+        let (mut cur_fg, mut cur_bg): (Option<(u8, u8, u8)>, Option<(u8, u8, u8)>) = (None, None);
+        let mut open = false;
+        for cx in 0..w {
+            let top = at(cx, ry * 2);
+            let bot = at(cx, ry * 2 + 1);
+            match (top, bot) {
+                (None, None) => {
+                    if open {
+                        out.push_str("\x1b[0m");
+                        open = false;
+                        cur_fg = None;
+                        cur_bg = None;
+                    }
+                    out.push(' ');
+                }
+                // One half transparent: draw the other half as a glyph on
+                // the terminal's own background.
+                (Some(c), None) | (None, Some(c)) => {
+                    if cur_bg.is_some() {
+                        out.push_str("\x1b[49m");
+                        cur_bg = None;
+                    }
+                    if cur_fg != Some(c) {
+                        out.push_str(&format!("\x1b[38;2;{};{};{}m", c.0, c.1, c.2));
+                        cur_fg = Some(c);
+                    }
+                    out.push(if top.is_some() { '▀' } else { '▄' });
+                    open = true;
+                }
+                (Some(t), Some(b)) => {
+                    if cur_fg != Some(t) {
+                        out.push_str(&format!("\x1b[38;2;{};{};{}m", t.0, t.1, t.2));
+                        cur_fg = Some(t);
+                    }
+                    if cur_bg != Some(b) {
+                        out.push_str(&format!("\x1b[48;2;{};{};{}m", b.0, b.1, b.2));
+                        cur_bg = Some(b);
+                    }
+                    out.push('▀');
+                    open = true;
+                }
+            }
+        }
+        if open {
+            out.push_str("\x1b[0m");
+        }
+    }
+    out
+}
+
+/// Render `path` into Unicode braille glyphs at (x, y), fitting within
+/// `max_width` × `max_height` character cells. Each cell is 2×4 dots, so
+/// the effective resolution is (2·max_width) × (4·max_height), with one
+/// colour per cell.
+///
+/// Which dots light is decided by an ordered dither rather than a fixed
+/// brightness cut. A cut loses every mid-tone — a bright photo comes out
+/// empty and a dark one solid — while dithering lets the density of lit
+/// dots track the actual brightness, which is what makes eight dots per
+/// cell worth having.
+fn braille_display(path: &str, x: u16, y: u16, max_width: u16, max_height: u16) -> bool {
+    let (w, h, px) = match pixel_grid(path, max_width as u32 * 2, max_height as u32 * 4) {
+        Some(g) => g,
+        None => return false,
+    };
+    let out = braille_frame(w, h, &px, x, y);
+    let _ = io::stdout().write_all(out.as_bytes());
+    let _ = io::stdout().flush();
+    true
+}
+
+/// One braille cell: which dots light, and the colour of the ones that
+/// did. Split out from the frame so the dither can be tested.
+fn braille_cell(w: u32, h: u32, px: &[u8], cx: u32, cy: u32) -> (u32, Option<(u8, u8, u8)>) {
+    // Braille dot bits: column-major, top to bottom.
     const DOT_BITS: [(u32, u32, u32); 8] = [
         (0, 0, 0x01), (0, 1, 0x02), (0, 2, 0x04), (0, 3, 0x40),
         (1, 0, 0x08), (1, 1, 0x10), (1, 2, 0x20), (1, 3, 0x80),
     ];
-
-    let mut out = String::with_capacity((cells_w as usize) * (cells_h as usize) * 24);
-    for cy in 0..cells_h {
-        out.push_str(&format!("\x1b[{};{}H", y + cy, x));
-        for cx in 0..cells_w {
-            let bx = (cx as u32) * 2;
-            let by = (cy as u32) * 4;
-            let mut mask: u32 = 0x2800;
-            let mut r_sum: u32 = 0;
-            let mut g_sum: u32 = 0;
-            let mut b_sum: u32 = 0;
-            let mut lit: u32 = 0;
-            for (dx, dy, bit) in &DOT_BITS {
-                let i = (((by + dy) * fit_w + (bx + dx)) * 4) as usize;
-                let r = bytes[i] as u32;
-                let g = bytes[i + 1] as u32;
-                let b = bytes[i + 2] as u32;
-                let a = bytes[i + 3] as u32;
-                // Lit if not transparent and darker than mid-gray (so light
-                // bgs render as empty cells rather than a solid block).
-                let bright = (r + g + b) / 3;
-                if a > 64 && bright < 200 {
-                    mask |= bit;
-                    r_sum += r; g_sum += g; b_sum += b;
-                    lit += 1;
-                }
-            }
-            let ch = char::from_u32(mask).unwrap_or(' ');
-            if lit > 0 {
-                let r = (r_sum / lit) as u8;
-                let g = (g_sum / lit) as u8;
-                let b = (b_sum / lit) as u8;
-                out.push_str(&format!("\x1b[38;2;{};{};{}m{}\x1b[39m", r, g, b, ch));
-            } else {
-                out.push(' ');
-            }
+    let mut mask: u32 = 0;
+    let (mut r_sum, mut g_sum, mut b_sum, mut lit) = (0u32, 0u32, 0u32, 0u32);
+    for (dx, dy, bit) in &DOT_BITS {
+        let (sx, sy) = (cx * 2 + dx, cy * 4 + dy);
+        if sx >= w || sy >= h {
+            continue;
+        }
+        let i = ((sy * w + sx) * 4) as usize;
+        let (r, g, b, a) = (px[i], px[i + 1], px[i + 2], px[i + 3]);
+        if a > 64 && luma(r, g, b) > BAYER_4X2[*dy as usize][*dx as usize] {
+            mask |= bit;
+            r_sum += r as u32;
+            g_sum += g as u32;
+            b_sum += b as u32;
+            lit += 1;
         }
     }
-    let _ = io::stdout().write_all(out.as_bytes());
-    let _ = io::stdout().flush();
-    true
+    if lit == 0 {
+        return (0, None);
+    }
+    // The cell takes the colour of the dots that lit, so a glyph shows
+    // what is actually there rather than a wash of the neighbourhood.
+    (mask, Some(((r_sum / lit) as u8, (g_sum / lit) as u8, (b_sum / lit) as u8)))
+}
+
+fn braille_frame(w: u32, h: u32, px: &[u8], x: u16, y: u16) -> String {
+    let cells_w = w.div_ceil(2);
+    let cells_h = h.div_ceil(4);
+
+    let mut out = String::with_capacity((cells_w * cells_h) as usize * 24);
+    for cy in 0..cells_h {
+        out.push_str(&format!("\x1b[{};{}H", y as u32 + cy, x));
+        let mut cur: Option<(u8, u8, u8)> = None;
+        for cx in 0..cells_w {
+            let (mask, colour) = braille_cell(w, h, px, cx, cy);
+            match colour {
+                None => {
+                    if cur.is_some() {
+                        out.push_str("\x1b[39m");
+                        cur = None;
+                    }
+                    out.push(' ');
+                }
+                Some(c) => {
+                    if cur != Some(c) {
+                        out.push_str(&format!("\x1b[38;2;{};{};{}m", c.0, c.1, c.2));
+                        cur = Some(c);
+                    }
+                    out.push(char::from_u32(0x2800 + mask).unwrap_or(' '));
+                }
+            }
+        }
+        if cur.is_some() {
+            out.push_str("\x1b[39m");
+        }
+    }
+    out
 }
 
 /// Plain-ASCII fallback renderer. Maps image luminance to a 10-level ramp,
@@ -1355,3 +1607,136 @@ fn get_terminal_pixel_size() -> (u32, u32, u32, u32) {
 }
 
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The two tables have to be each other's inverse, or every colour
+    /// drifts a little every time an image is scaled.
+    #[test]
+    fn the_light_tables_round_trip() {
+        let lin = srgb_to_linear();
+        for v in 0u8..=255 {
+            let back = linear_to_srgb(lin[v as usize]);
+            assert!(back.abs_diff(v) <= 1, "{v} came back as {back}");
+        }
+        assert_eq!(lin[0], 0);
+        assert_eq!(lin[255], 65535);
+        // Middle grey is dark in linear light: that is the whole point.
+        assert!(lin[128] < 22000, "sRGB 128 is {} of 65535", lin[128]);
+    }
+
+    /// Shrinking a black-and-white checkerboard has to give the grey it
+    /// physically is. Adding sRGB bytes would give 128, which is the
+    /// classic too-dark thumbnail; in linear light it comes out at 188.
+    #[test]
+    fn shrinking_does_not_darken() {
+        let mut px = Vec::new();
+        for y in 0..2u32 {
+            for x in 0..2u32 {
+                let v = if (x + y) % 2 == 0 { 255u8 } else { 0u8 };
+                px.extend_from_slice(&[v, v, v, 255]);
+            }
+        }
+        let out = box_average(&px, 2, 2, 1, 1);
+        assert!(
+            (out[0] as i32 - 188).abs() <= 2,
+            "half black half white came out at {}, not 188",
+            out[0]
+        );
+        assert_eq!(out[3], 255);
+    }
+
+    /// A transparent pixel must not tint the ones it is averaged with,
+    /// and a fully transparent block stays transparent.
+    #[test]
+    fn transparency_does_not_bleed() {
+        let px = [
+            255, 0, 0, 255, // red, opaque
+            0, 255, 0, 0,   // green, invisible
+        ];
+        let out = box_average(&px, 2, 1, 1, 1);
+        assert_eq!((out[0], out[1], out[2]), (255, 0, 0));
+        assert_eq!(out[3], 127);
+        let clear = box_average(&[9, 9, 9, 0, 9, 9, 9, 0], 2, 1, 1, 1);
+        assert_eq!(clear[3], 0);
+    }
+
+    #[test]
+    fn fitting_keeps_the_shape() {
+        assert_eq!(fit_within(1000, 500, 100, 100), (100, 50));
+        assert_eq!(fit_within(500, 1000, 100, 100), (50, 100));
+        assert_eq!(fit_within(10, 10, 100, 40), (40, 40));
+        // Never zero, however extreme the shape.
+        let (w, h) = fit_within(4000, 3, 80, 24);
+        assert!(w >= 1 && h >= 1);
+    }
+
+    /// A flat grey fills about half the dots in a cell, which is what a
+    /// fixed threshold cannot do: it would give none or all.
+    #[test]
+    fn the_dither_keeps_the_midtones() {
+        let flat = |v: u8| vec![v, v, v, 255].repeat(8);
+        let lit = |v: u8| braille_cell(2, 4, &flat(v), 0, 0).0.count_ones();
+        assert_eq!(lit(0), 0, "black should light nothing");
+        assert_eq!(lit(255), 8, "white should light everything");
+        assert_eq!(lit(128), 4, "mid grey should light half");
+        // And it climbs all the way up, one dot at a time.
+        let steps: Vec<u32> = (0..=8).map(|i| lit((i * 255 / 8) as u8)).collect();
+        assert_eq!(steps, vec![0, 1, 2, 3, 4, 5, 6, 7, 8], "{steps:?}");
+    }
+
+    /// A cell shows the colour of the dots that lit, not of the whole
+    /// neighbourhood: a red dot on black stays red.
+    #[test]
+    fn a_cell_takes_the_colour_of_its_ink() {
+        let mut px = vec![0u8; 2 * 4 * 4];
+        px[0..4].copy_from_slice(&[255, 40, 40, 255]); // one bright red dot
+        let (mask, colour) = braille_cell(2, 4, &px, 0, 0);
+        assert_eq!(mask, 0x01);
+        assert_eq!(colour, Some((255, 40, 40)));
+    }
+
+    /// Half blocks: two colours per cell, and runs of one colour emit
+    /// the escape once.
+    #[test]
+    fn half_blocks_carry_two_colours() {
+        // Two cells wide, two pixels tall: red over blue, twice.
+        let mut px = Vec::new();
+        for _ in 0..2 {
+            px.extend_from_slice(&[255, 0, 0, 255]);
+        }
+        for _ in 0..2 {
+            px.extend_from_slice(&[0, 0, 255, 255]);
+        }
+        let frame = half_block_frame(2, 2, &px, 1, 1);
+        assert!(frame.contains("38;2;255;0;0"), "no red foreground: {frame:?}");
+        assert!(frame.contains("48;2;0;0;255"), "no blue background: {frame:?}");
+        assert_eq!(frame.matches('▀').count(), 2);
+        // One SGR pair for the run, not one per cell.
+        assert_eq!(frame.matches("38;2;").count(), 1, "{frame:?}");
+    }
+
+    /// A transparent half draws the other half as a glyph, and a fully
+    /// transparent cell leaves the terminal alone.
+    #[test]
+    fn half_blocks_respect_transparency() {
+        let px = [
+            0, 0, 0, 0,       // top: clear
+            10, 200, 10, 255, // bottom: green
+            0, 0, 0, 0,       // top: clear
+            0, 0, 0, 0,       // bottom: clear
+        ];
+        // Two columns, two rows: column 0 is half green, column 1 empty.
+        let mut grid = vec![0u8; 2 * 2 * 4];
+        grid[0..4].copy_from_slice(&px[0..4]);
+        grid[4..8].copy_from_slice(&px[8..12]);
+        grid[8..12].copy_from_slice(&px[4..8]);
+        grid[12..16].copy_from_slice(&px[12..16]);
+        let frame = half_block_frame(2, 2, &grid, 1, 1);
+        assert!(frame.contains('▄'), "lower half should be drawn: {frame:?}");
+        assert!(frame.ends_with("\x1b[0m") || frame.contains(' '));
+        assert!(!frame.contains("48;2;"), "nothing to paint behind: {frame:?}");
+    }
+}
