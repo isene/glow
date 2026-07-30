@@ -1016,15 +1016,25 @@ fn w3m_clear(x: u16, y: u16, width: u16, height: u16, term_width: u16, term_heig
 // --- Chafa ASCII art ---
 
 fn chafa_display(image_path: &str, x: u16, y: u16, max_width: u16, max_height: u16) -> bool {
-    let output = Command::new("chafa")
-        .args([
-            "--size", &format!("{}x{}", max_width, max_height),
-            "--animate", "off",
-            "--format", "symbols",  // Force text symbols, not sixel/kitty
-            "--color-space", "din99d",
-        ])
-        .arg(image_path)
-        .output();
+    let size = format!("{}x{}", max_width, max_height);
+    let base = [
+        "--size", &size,
+        "--animate", "off",
+        "--format", "symbols",  // Force text symbols, not sixel/kitty
+        "--color-space", "din99d",
+    ];
+    let run = |extra: &[&str]| {
+        Command::new("chafa").args(base).args(extra).arg(image_path).output()
+    };
+    // Left alone, chafa asks the terminal what it can do and waits up to
+    // five seconds for an answer. A terminal that never replies costs
+    // exactly those five seconds, every image. We already decided the
+    // format, so there is nothing to ask. Older chafa has no --probe, so
+    // fall back to a plain run if that fails.
+    let output = match run(&["--probe", "off"]) {
+        Ok(o) if o.status.success() => Ok(o),
+        _ => run(&[]),
+    };
     match output {
         Ok(o) if o.status.success() => {
             let text = String::from_utf8_lossy(&o.stdout);

@@ -5,10 +5,12 @@
 //! imgcompare photo.jpg
 //! ```
 //!
-//! Needs a wide window. Press Enter to put the screen back.
+//! Each panel is timed. Needs a wide window. Any key puts the screen
+//! back.
 
 use glow::{Display, Protocol};
-use std::io::{BufRead, Write};
+use std::io::{Read, Write};
+use std::time::Instant;
 
 const PANELS: [(&str, &str); 3] = [
     ("kitty", "the real pixels"),
@@ -39,34 +41,38 @@ fn main() {
     // escapes to one that does not paints garbage over the other panels.
     let kitty = matches!(Display::new().protocol(), Some(Protocol::Kitty));
 
-    print!("\x1b[2J\x1b[H\x1b[?25l");
-    println!("\x1b[1m{path}\x1b[0m");
+    let saved = raw_mode();
+    print!("\x1b[2J\x1b[H\x1b[?25l\x1b[1m{path}\x1b[0m");
 
     let mut shown: Vec<Display> = Vec::new();
     for (i, (mode, label)) in PANELS.iter().enumerate() {
         let x = 1 + i as u16 * (pw + gap);
         print!("\x1b[2;{x}H\x1b[1m{mode}\x1b[0m \x1b[2m{label}\x1b[0m");
-        // Flush the label before rendering: chafa can take a second on a
-        // big picture, and a buffered label would appear only after it.
         std::io::stdout().flush().ok();
         if *mode == "kitty" && !kitty {
-            print!("\x1b[4;{x}H\x1b[2mthis terminal has no kitty protocol\x1b[0m");
+            note(x, "this terminal has no kitty protocol");
             continue;
         }
         let mut d = Display::with_mode(mode);
         if d.protocol().is_none() {
-            print!("\x1b[4;{x}H\x1b[2m{mode} is not available here\x1b[0m");
+            note(x, &format!("{mode} is not available here"));
             continue;
         }
-        if !d.show(&path, x, 3, pw, ph) {
-            print!("\x1b[4;{x}H\x1b[2m{mode} rendered nothing\x1b[0m");
+        let mut ok = true;
+        let ms = painted(|| ok = d.show(&path, x, 3, pw, ph));
+        if ok {
+            print!("\x1b[2;{}H\x1b[2m{ms} ms\x1b[0m", x + pw.saturating_sub(6));
+            std::io::stdout().flush().ok();
+        } else {
+            note(x, &format!("{mode} rendered nothing"));
         }
         shown.push(d);
     }
 
-    print!("\x1b[{};1H\x1b[2mEnter to finish\x1b[0m", rows);
+    print!("\x1b[{rows};1H\x1b[2many key to finish\x1b[0m");
     std::io::stdout().flush().ok();
-    std::io::stdin().lock().read_line(&mut String::new()).ok();
+    let mut byte = [0u8; 1];
+    std::io::stdin().read_exact(&mut byte).ok();
 
     // Kitty placements outlive the process unless someone deletes them.
     for d in shown.iter_mut() {
@@ -74,4 +80,46 @@ fn main() {
     }
     print!("\x1b[?25h\x1b[2J\x1b[H");
     std::io::stdout().flush().ok();
+    restore(saved);
+}
+
+fn note(x: u16, msg: &str) {
+    print!("\x1b[4;{x}H\x1b[2m{msg}\x1b[0m");
+    std::io::stdout().flush().ok();
+}
+
+/// How long the panel took: decode, scale, and get the bytes out.
+///
+/// This covers more than it looks. A quarter of a megabyte of escape
+/// sequences does not fit in a pty buffer, so the write blocks until the
+/// terminal has chewed through most of it. What it cannot see is the
+/// last screenful, and any repaint the terminal does after we are done.
+fn painted(f: impl FnOnce()) -> u128 {
+    let start = Instant::now();
+    f();
+    std::io::stdout().flush().ok();
+    start.elapsed().as_millis()
+}
+
+// --- raw mode, so the cursor-position reply does not echo ---
+
+fn raw_mode() -> Option<libc::termios> {
+    unsafe {
+        let mut t: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(0, &mut t) != 0 {
+            return None;
+        }
+        let saved = t;
+        libc::cfmakeraw(&mut t);
+        libc::tcsetattr(0, libc::TCSANOW, &t);
+        Some(saved)
+    }
+}
+
+fn restore(saved: Option<libc::termios>) {
+    if let Some(t) = saved {
+        unsafe {
+            libc::tcsetattr(0, libc::TCSANOW, &t);
+        }
+    }
 }
