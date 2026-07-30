@@ -1555,6 +1555,15 @@ fn png_width(data: &[u8]) -> Option<u32> {
     }
 }
 
+/// The terminal, in characters: (columns, rows). Falls back to 80×24
+/// when the ioctl says nothing.
+pub fn terminal_size() -> (u16, u16) {
+    match crossterm_size() {
+        Ok((rows, cols)) => (cols, rows),
+        Err(_) => (80, 24),
+    }
+}
+
 pub fn get_cell_size() -> (u16, u16) {
     // Try to get pixel size from terminal
     if let Ok((rows, cols)) = crossterm_size() {

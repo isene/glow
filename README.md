@@ -73,6 +73,13 @@ cargo run --release --example show -- halfblock photo.jpg 100 34
 cargo run --release --example show -- braille   photo.jpg 100 34
 ```
 
+Or all three renderings at once, in three panels: the real pixels through
+the kitty protocol, glow's half blocks, and chafa for comparison.
+
+```sh
+cargo run --release --example imgcompare -- photo.jpg
+```
+
 ## API
 
 ```rust
