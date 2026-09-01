@@ -193,8 +193,13 @@ fn encode_png(
 ) -> Option<()> {
     use image::codecs::png::{PngEncoder, CompressionType, FilterType as PngFilter};
     use image::ImageEncoder;
-    out.reserve(w as usize * h as usize);
-    PngEncoder::new_with_quality(out, CompressionType::Fast, PngFilter::NoFilter)
+    // Adaptive filtering, not none. Measured on a 1024x1312 page: no
+    // filter took 10 ms and wrote 2,225 KB; adaptive took 4 ms and wrote
+    // 236 KB. Filtering is cheaper than writing the bytes it saves, and
+    // every one of those bytes is base64'd, pushed through the pty and
+    // inflated by the terminal.
+    out.reserve(w as usize * h as usize / 8);
+    PngEncoder::new_with_quality(out, CompressionType::Fast, PngFilter::Adaptive)
         .write_image(buf.as_raw(), w, h, image::ExtendedColorType::Rgba8).ok()
 }
 
