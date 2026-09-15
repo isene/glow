@@ -486,6 +486,44 @@ impl Display {
         }
     }
 
+    /// Show a PNG the caller made in memory, at cell (`x`, `y`), in a box
+    /// of `width` × `height` cells. For a picture drawn fresh on every key
+    /// press: under kitty the bytes go straight to the terminal, with no
+    /// file and nothing added to the image caches, which would otherwise
+    /// keep every frame. Size the PNG to whole cells (`get_cell_size`) and
+    /// kitty places it without stretching. Other protocols read it from a
+    /// temporary file through [`show`](Self::show). Call `clear` first
+    /// when replacing an earlier picture, so the terminal can free it.
+    pub fn show_png(&mut self, png: &[u8], x: u16, y: u16, width: u16, height: u16) -> bool {
+        let Some(proto) = self.protocol else { return false };
+        if proto != Protocol::Kitty {
+            self.next_id = self.next_id.wrapping_add(1);
+            let path = std::env::temp_dir()
+                .join(format!("glow-{}-{}.png", std::process::id(), self.next_id));
+            if std::fs::write(&path, png).is_err() { return false; }
+            let ok = self.show(&path.to_string_lossy(), x, y, width, height);
+            // w3m's helper reads the file after we return; the rest are done with it.
+            if proto != Protocol::W3m { let _ = std::fs::remove_file(&path); }
+            return ok;
+        }
+        let (cell_w, cell_h) = get_cell_size();
+        if cell_w == 0 || cell_h == 0 { return false; }
+        let (Some(w), Some(h)) = (png_width(png), png_height(png)) else { return false };
+        let cols = w.div_ceil(cell_w as u32).clamp(1, width.max(1) as u32);
+        let rows = h.div_ceil(cell_h as u32).clamp(1, height.max(1) as u32);
+        let _sync = SyncOutput::begin();
+        let id = self.allocate_id();
+        kitty_transmit(id, png);
+        print!("\x1b[{};{}H", y, x);
+        let place = format!("\x1b_Ga=p,i={},c={},r={},z=1,q=2,C=1\x1b\\", id, cols, rows);
+        // Placed twice, as in `kitty_display`: kitty can drop the first
+        // place while the last chunk is still being assembled.
+        print!("{}{}", place, place);
+        io::stdout().flush().ok();
+        self.active_ids.push(id);
+        true
+    }
+
     /// Delete just the placement(s) for `image_path` (per-id `a=d,d=i`).
     /// Lets callers do per-image diffs without nuking every active id —
     /// otherwise every line of scrolling burns fresh IMG_SLOTS for
@@ -843,20 +881,7 @@ impl Display {
             // The t=f / file-path transmit attempted in v0.1.17 broke
             // image display entirely — under investigation. Keep this
             // path until we've verified t=f works flawlessly.
-            let encoded = base64::engine::general_purpose::STANDARD.encode(&png_data);
-            let chunks: Vec<&str> = encoded.as_bytes()
-                .chunks(4096)
-                .map(|c| std::str::from_utf8(c).unwrap_or(""))
-                .collect();
-            for (idx, chunk) in chunks.iter().enumerate() {
-                let more = if idx < chunks.len() - 1 { 1 } else { 0 };
-                if idx == 0 {
-                    print!("\x1b_Ga=t,f=100,i={},q=2,m={};{}\x1b\\", id, more, chunk);
-                } else {
-                    print!("\x1b_Gm={};{}\x1b\\", more, chunk);
-                }
-            }
-            io::stdout().flush().ok();
+            kitty_transmit(id, &png_data);
             // Cache the actual PNG pixel dims (not cell-rounded) so the
             // fit/scale math below operates on truth, not on the
             // cell-aligned approximation. With 12-px cells a 241-px
@@ -913,6 +938,25 @@ impl Display {
         }
         true
     }
+}
+
+/// Send PNG bytes to a kitty terminal as image `id`, base64 in 4096-byte
+/// chunks, without placing it.
+fn kitty_transmit(id: u32, png: &[u8]) {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(png);
+    let chunks: Vec<&str> = encoded.as_bytes()
+        .chunks(4096)
+        .map(|c| std::str::from_utf8(c).unwrap_or(""))
+        .collect();
+    for (idx, chunk) in chunks.iter().enumerate() {
+        let more = if idx < chunks.len() - 1 { 1 } else { 0 };
+        if idx == 0 {
+            print!("\x1b_Ga=t,f=100,i={},q=2,m={};{}\x1b\\", id, more, chunk);
+        } else {
+            print!("\x1b_Gm={};{}\x1b\\", more, chunk);
+        }
+    }
+    io::stdout().flush().ok();
 }
 
 // --- Sixel protocol ---
@@ -1634,6 +1678,21 @@ fn get_terminal_pixel_size() -> (u32, u32, u32, u32) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_png_from_memory_is_placed_and_cleared() {
+        let mut png = Vec::new();
+        image::ImageEncoder::write_image(
+            image::codecs::png::PngEncoder::new(&mut png),
+            &[128u8; 20 * 40], 20, 40, image::ExtendedColorType::L8,
+        ).unwrap();
+        let mut d = super::Display::with_mode("kitty");
+        assert!(d.show_png(&png, 1, 1, 2, 2));
+        assert_eq!(d.active_ids.len(), 1);
+        d.clear(1, 1, 2, 2, 80, 24);
+        assert!(d.active_ids.is_empty());
+        assert!(!super::Display::with_mode("off").show_png(&png, 1, 1, 2, 2));
+    }
+
     use super::*;
 
     /// The two tables have to be each other's inverse, or every colour

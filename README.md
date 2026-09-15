@@ -101,6 +101,12 @@ impl Display {
         max_width: u16, max_height: u16     // Max size in chars
     ) -> bool;                               // Success
 
+    pub fn show_png(&mut self,
+        png: &[u8],                          // PNG made in memory, sized to whole cells
+        x: u16, y: u16,                     // Character position
+        width: u16, height: u16             // Box in chars
+    ) -> bool;                               // Kitty: no file, no cache
+
     pub fn clear(&mut self,
         x: u16, y: u16,                     // Region position
         width: u16, height: u16,            // Region size
