@@ -618,7 +618,7 @@ impl Display {
             .and_then(|m| m.modified())
             .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs())
             .unwrap_or(0);
-        let cache_key = format!("{}:{}x{}:{}", image_path, pixel_w, pixel_h, mtime);
+        let cache_key = format!("{}:{}x{}:{}{}", image_path, pixel_w, pixel_h, mtime, if is_svg(image_path) { ":rsvg" } else { "" });
         let cached_live = self.image_cache.get(&cache_key)
             .filter(|(id, _, _)| self.active_ids.contains(id))
             .copied();
@@ -636,13 +636,7 @@ impl Display {
         let png_data = match cache_get(&self.png_cache, &cache_key) {
             Some(data) => data,
             None => {
-                let output = Command::new(imagemagick_cmd())
-                    .arg(format!("{}[0]", image_path))
-                    .arg("-auto-orient")
-                    .arg("-resize")
-                    .arg(format!("{}x{}>", pixel_w, pixel_h))
-                    .arg("PNG:-")
-                    .output();
+                let output = raster_png(image_path, pixel_w, pixel_h);
                 let data = match output {
                     Ok(o) if !o.stdout.is_empty() => o.stdout,
                     _ => return None,
@@ -777,7 +771,7 @@ impl Display {
             .and_then(|m| m.modified())
             .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs())
             .unwrap_or(0);
-        let cache_key = format!("{}:{}x{}:{}", image_path, pixel_w, pixel_h, mtime);
+        let cache_key = format!("{}:{}x{}:{}{}", image_path, pixel_w, pixel_h, mtime, if is_svg(image_path) { ":rsvg" } else { "" });
 
         // Cache hit only counts if the image is still considered "live"
         // server-side. Once clear() deletes the only placement of an image
@@ -821,13 +815,7 @@ impl Display {
                         data
                     } else {
                         // Magick fallback: resize, then optional pad.
-                        let output = Command::new(imagemagick_cmd())
-                            .arg(format!("{}[0]", image_path))
-                            .arg("-auto-orient")
-                            .arg("-resize")
-                            .arg(format!("{}x{}>", pixel_w, pixel_h))
-                            .arg("PNG:-")
-                            .output();
+                        let output = raster_png(image_path, pixel_w, pixel_h);
                         let raw_data = match output {
                             Ok(o) if !o.stdout.is_empty() => o.stdout,
                             _ => return false,
@@ -1254,9 +1242,14 @@ fn pixel_grid(path: &str, max_w: u32, max_h: u32) -> Option<(u32, u32, Vec<u8>)>
     if max_w == 0 || max_h == 0 {
         return None;
     }
+    if is_svg(path) && have_rsvg() {
+        let png = raster_png(path, max_w, max_h).ok()?.stdout;
+        let img = image::load_from_memory(&png).ok()?.to_rgba8();
+        return Some((img.width(), img.height(), img.into_raw()));
+    }
     match pixel_grid_native(path, max_w, max_h) {
         Some(g) => Some(g),
-        // HEIC, SVG, odd CMYK JPEGs: whatever the `image` crate will not
+        // HEIC, odd CMYK JPEGs: whatever the `image` crate will not
         // decode, ImageMagick still can.
         None => pixel_grid_magick(path, max_w, max_h),
     }
@@ -1629,6 +1622,39 @@ fn command_exists(cmd: &str) -> bool {
 /// legacy `convert` symlink prints a deprecation warning on some
 /// distros (Arch/Endeavour) which then bleeds onto the user's
 /// terminal during a render pass. Resolved once per process.
+/// The file rendered to a PNG that fits in `max_w` × `max_h`, without
+/// enlarging a raster. An SVG goes through rsvg-convert when it is
+/// installed: ImageMagick's own SVG renderer drops gradients and
+/// misplaces text. Everything else goes through ImageMagick.
+fn raster_png(path: &str, max_w: u32, max_h: u32) -> std::io::Result<std::process::Output> {
+    if is_svg(path) && have_rsvg() {
+        return Command::new("rsvg-convert")
+            .arg("-w").arg(max_w.to_string())
+            .arg("-h").arg(max_h.to_string())
+            .arg("--keep-aspect-ratio")
+            .arg("-f").arg("png")
+            .arg(path)
+            .output();
+    }
+    Command::new(imagemagick_cmd())
+        .arg(format!("{}[0]", path))
+        .arg("-auto-orient")
+        .arg("-resize")
+        .arg(format!("{}x{}>", max_w, max_h))
+        .arg("PNG:-")
+        .output()
+}
+
+fn is_svg(path: &str) -> bool {
+    let p = path.to_ascii_lowercase();
+    p.ends_with(".svg") || p.ends_with(".svgz")
+}
+
+fn have_rsvg() -> bool {
+    static HAVE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HAVE.get_or_init(|| command_exists("rsvg-convert"))
+}
+
 fn imagemagick_cmd() -> &'static str {
     static CHOICE: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
     CHOICE.get_or_init(|| {
