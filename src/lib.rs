@@ -1616,6 +1616,33 @@ fn png_width(data: &[u8]) -> Option<u32> {
 
 /// The terminal, in characters: (columns, rows). Falls back to 80×24
 /// when the ioctl says nothing.
+/// A raw RGBA frame as one kitty transmit-and-place, for a program that
+/// redraws whole frames, such as a game: image `id` is replaced on
+/// every call, the placement fills `cols` by `rows` cells from the
+/// cursor, the cursor stays put and the terminal stays quiet. Send the
+/// returned string after moving the cursor to the top-left cell.
+pub fn kitty_frame(id: u32, width: u32, height: u32, cols: u16, rows: u16, rgba: &[u8]) -> String {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(rgba);
+    let chunks: Vec<&[u8]> = encoded.as_bytes().chunks(4096).collect();
+    let mut out = String::with_capacity(encoded.len() + chunks.len() * 16 + 64);
+    for (idx, chunk) in chunks.iter().enumerate() {
+        let more = if idx + 1 < chunks.len() { 1 } else { 0 };
+        let chunk = std::str::from_utf8(chunk).unwrap_or("");
+        if idx == 0 {
+            out.push_str(&format!("\x1b_Ga=T,f=32,i={},s={},v={},c={},r={},q=2,C=1,m={};{}\x1b\\",
+                id, width, height, cols, rows, more, chunk));
+        } else {
+            out.push_str(&format!("\x1b_Gm={};{}\x1b\\", more, chunk));
+        }
+    }
+    out
+}
+
+/// Delete image `id` and its placements.
+pub fn kitty_forget(id: u32) -> String {
+    format!("\x1b_Ga=d,d=i,i={},q=2\x1b\\", id)
+}
+
 pub fn terminal_size() -> (u16, u16) {
     match crossterm_size() {
         Ok((rows, cols)) => (cols, rows),
