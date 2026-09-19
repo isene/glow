@@ -942,7 +942,47 @@ impl Display {
 
 /// Send PNG bytes to a kitty terminal as image `id`, base64 in 4096-byte
 /// chunks, without placing it.
+/// True inside glass, which sets `_GLASS_ID` for its children. glass
+/// takes raw pixels over shared memory, so no PNG has to be decoded by
+/// a forked ImageMagick on its side and no base64 crosses the pty.
+fn in_glass() -> bool {
+    std::env::var_os("_GLASS_ID").is_some()
+}
+
+static SHM_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Write `bytes` to a fresh shared-memory file and return its name, the
+/// way the kitty protocol's `t=s` wants it. A ring of names per process
+/// keeps a frame from landing on a file the terminal has not read yet.
+fn shm_write(bytes: &[u8], ring: u32) -> Option<String> {
+    let n = SHM_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % ring.max(1);
+    let name = format!("glow-{}-{}", std::process::id(), n);
+    std::fs::write(format!("/dev/shm/{}", name), bytes).ok()?;
+    Some(name)
+}
+
+/// The transmit for a PNG inside glass: decode it here, hand the pixels
+/// over shared memory. None when the PNG does not decode.
+fn kitty_transmit_shm(id: u32, png: &[u8]) -> Option<String> {
+    let img = image::load_from_memory(png).ok()?;
+    let (w, h) = (img.width(), img.height());
+    let (fmt, name) = if img.color().has_alpha() {
+        (32, shm_write(img.to_rgba8().as_raw(), 64)?)
+    } else {
+        (24, shm_write(img.to_rgb8().as_raw(), 64)?)
+    };
+    let payload = base64::engine::general_purpose::STANDARD.encode(name.as_bytes());
+    Some(format!("\x1b_Ga=t,f={},t=s,i={},s={},v={},q=2;{}\x1b\\", fmt, id, w, h, payload))
+}
+
 fn kitty_transmit(id: u32, png: &[u8]) {
+    if in_glass() {
+        if let Some(seq) = kitty_transmit_shm(id, png) {
+            print!("{}", seq);
+            io::stdout().flush().ok();
+            return;
+        }
+    }
     let encoded = base64::engine::general_purpose::STANDARD.encode(png);
     let chunks: Vec<&str> = encoded.as_bytes()
         .chunks(4096)
@@ -1622,6 +1662,13 @@ fn png_width(data: &[u8]) -> Option<u32> {
 /// cursor, the cursor stays put and the terminal stays quiet. Send the
 /// returned string after moving the cursor to the top-left cell.
 pub fn kitty_frame(id: u32, width: u32, height: u32, cols: u16, rows: u16, rgba: &[u8]) -> String {
+    if in_glass() {
+        if let Some(name) = shm_write(rgba, 8) {
+            let payload = base64::engine::general_purpose::STANDARD.encode(name.as_bytes());
+            return format!("\x1b_Ga=T,f=32,t=s,i={},s={},v={},c={},r={},q=2,C=1;{}\x1b\\",
+                id, width, height, cols, rows, payload);
+        }
+    }
     let encoded = base64::engine::general_purpose::STANDARD.encode(rgba);
     let chunks: Vec<&[u8]> = encoded.as_bytes().chunks(4096).collect();
     let mut out = String::with_capacity(encoded.len() + chunks.len() * 16 + 64);
@@ -1630,6 +1677,33 @@ pub fn kitty_frame(id: u32, width: u32, height: u32, cols: u16, rows: u16, rgba:
         let chunk = std::str::from_utf8(chunk).unwrap_or("");
         if idx == 0 {
             out.push_str(&format!("\x1b_Ga=T,f=32,i={},s={},v={},c={},r={},q=2,C=1,m={};{}\x1b\\",
+                id, width, height, cols, rows, more, chunk));
+        } else {
+            out.push_str(&format!("\x1b_Gm={};{}\x1b\\", more, chunk));
+        }
+    }
+    out
+}
+
+/// As [`kitty_frame`], with RGB pixels and no alpha: a quarter less to
+/// move, and the format glass draws fastest. Inside glass the pixels go
+/// over shared memory; elsewhere as base64 in chunks.
+pub fn kitty_frame_rgb(id: u32, width: u32, height: u32, cols: u16, rows: u16, rgb: &[u8]) -> String {
+    if in_glass() {
+        if let Some(name) = shm_write(rgb, 8) {
+            let payload = base64::engine::general_purpose::STANDARD.encode(name.as_bytes());
+            return format!("\x1b_Ga=T,f=24,t=s,i={},s={},v={},c={},r={},q=2,C=1;{}\x1b\\",
+                id, width, height, cols, rows, payload);
+        }
+    }
+    let encoded = base64::engine::general_purpose::STANDARD.encode(rgb);
+    let chunks: Vec<&[u8]> = encoded.as_bytes().chunks(4096).collect();
+    let mut out = String::with_capacity(encoded.len() + chunks.len() * 16 + 64);
+    for (idx, chunk) in chunks.iter().enumerate() {
+        let more = if idx + 1 < chunks.len() { 1 } else { 0 };
+        let chunk = std::str::from_utf8(chunk).unwrap_or("");
+        if idx == 0 {
+            out.push_str(&format!("\x1b_Ga=T,f=24,i={},s={},v={},c={},r={},q=2,C=1,m={};{}\x1b\\",
                 id, width, height, cols, rows, more, chunk));
         } else {
             out.push_str(&format!("\x1b_Gm={};{}\x1b\\", more, chunk));
@@ -1848,5 +1922,24 @@ mod tests {
         assert!(frame.contains('▄'), "lower half should be drawn: {frame:?}");
         assert!(frame.ends_with("\x1b[0m") || frame.contains(' '));
         assert!(!frame.contains("48;2;"), "nothing to paint behind: {frame:?}");
+    }
+}
+
+#[cfg(test)]
+mod shm_tests {
+    use super::*;
+
+    #[test]
+    fn a_png_goes_to_shared_memory_as_raw_pixels_with_the_right_header() {
+        let mut png = Vec::new();
+        let px = image::RgbaImage::from_raw(2, 1, vec![255, 0, 0, 255, 0, 255, 0, 255]).unwrap();
+        px.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+        let seq = kitty_transmit_shm(7, &png).expect("decodes");
+        assert!(seq.starts_with("\x1b_Ga=t,f=32,t=s,i=7,s=2,v=1,q=2;"), "{}", seq);
+        let payload = seq.trim_end_matches("\x1b\\").rsplit(';').next().unwrap();
+        let name = String::from_utf8(base64::engine::general_purpose::STANDARD.decode(payload).unwrap()).unwrap();
+        let bytes = std::fs::read(format!("/dev/shm/{}", name)).unwrap();
+        assert_eq!(bytes, vec![255, 0, 0, 255, 0, 255, 0, 255]);
+        let _ = std::fs::remove_file(format!("/dev/shm/{}", name));
     }
 }
