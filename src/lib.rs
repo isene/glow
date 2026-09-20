@@ -1857,6 +1857,92 @@ impl Canvas {
         }
     }
 
+    /// Make the whole canvas see-through, for a picture that only paints
+    /// what is there and leaves the terminal's background elsewhere.
+    pub fn see_through(&mut self) {
+        for px in self.rgba.chunks_mut(4) {
+            px[3] = 0;
+        }
+    }
+
+    /// Paint `rgb` over one pixel with cover `a` (0 to 1), source over
+    /// what is there. Off the canvas is ignored.
+    pub fn blend(&mut self, x: i64, y: i64, rgb: (u8, u8, u8), a: f64) {
+        if x < 0 || y < 0 || x as usize >= self.w || y as usize >= self.h {
+            return;
+        }
+        let o = (y as usize * self.w + x as usize) * 4;
+        let a = a.clamp(0.0, 1.0);
+        let da = self.rgba[o + 3] as f64 / 255.0;
+        let out = a + da * (1.0 - a);
+        if out <= 0.0 {
+            return;
+        }
+        for (k, s) in [rgb.0, rgb.1, rgb.2].into_iter().enumerate() {
+            let d = self.rgba[o + k] as f64;
+            self.rgba[o + k] = ((s as f64 * a + d * da * (1.0 - a)) / out).round().clamp(0.0, 255.0) as u8;
+        }
+        self.rgba[o + 3] = (out * 255.0).round() as u8;
+    }
+
+    /// A soft-edged disc of radius `r` pixels about (`cx`, `cy`).
+    pub fn disc(&mut self, cx: f64, cy: f64, r: f64, rgb: (u8, u8, u8), a: f64) {
+        for y in (cy - r - 1.0).floor() as i64..=(cy + r + 1.0).ceil() as i64 {
+            for x in (cx - r - 1.0).floor() as i64..=(cx + r + 1.0).ceil() as i64 {
+                let d = ((x as f64 + 0.5 - cx).powi(2) + (y as f64 + 0.5 - cy).powi(2)).sqrt();
+                let k = (r + 0.5 - d).clamp(0.0, 1.0);
+                if k > 0.0 {
+                    self.blend(x, y, rgb, a * k);
+                }
+            }
+        }
+    }
+
+    /// A one-pixel ring of radius `r` about (`cx`, `cy`).
+    pub fn ring(&mut self, cx: f64, cy: f64, r: f64, rgb: (u8, u8, u8), a: f64) {
+        for y in (cy - r - 1.0).floor() as i64..=(cy + r + 1.0).ceil() as i64 {
+            for x in (cx - r - 1.0).floor() as i64..=(cx + r + 1.0).ceil() as i64 {
+                let d = ((x as f64 + 0.5 - cx).powi(2) + (y as f64 + 0.5 - cy).powi(2)).sqrt();
+                let k = 1.0 - (d - r).abs();
+                if k > 0.0 {
+                    self.blend(x, y, rgb, a * k);
+                }
+            }
+        }
+    }
+
+    /// A line from `a` to `b`, `thick` pixels wide.
+    pub fn line(&mut self, a: (f64, f64), b: (f64, f64), thick: f64, rgb: (u8, u8, u8), alpha: f64) {
+        let n = ((b.0 - a.0).abs().max((b.1 - a.1).abs()) * 1.5).ceil().max(1.0) as usize;
+        let r = (thick / 2.0).max(0.5);
+        for i in 0..=n {
+            let f = i as f64 / n as f64;
+            let (x, y) = (a.0 + (b.0 - a.0) * f, a.1 + (b.1 - a.1) * f);
+            if r <= 0.6 {
+                self.blend(x as i64, y as i64, rgb, alpha);
+            } else {
+                self.disc(x, y, r, rgb, alpha);
+            }
+        }
+    }
+
+    /// Settle every half-covered pixel to drawn or not, by an ordered
+    /// dither. Glass paints a pixel in full or not at all, so a soft edge
+    /// over the terminal's background has to be decided before sending.
+    pub fn settle_alpha(&mut self) {
+        const BAYER: [[u8; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
+        for y in 0..self.h {
+            for x in 0..self.w {
+                let o = (y * self.w + x) * 4;
+                let a = self.rgba[o + 3];
+                if a == 0 || a == 255 {
+                    continue;
+                }
+                self.rgba[o + 3] = if a > BAYER[y % 4][x % 4] * 16 + 8 { 255 } else { 0 };
+            }
+        }
+    }
+
     /// The canvas as a PNG, encoded for speed rather than size.
     pub fn png(&self) -> Vec<u8> {
         let mut png = Vec::new();
@@ -1876,6 +1962,22 @@ impl Display {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn drawing_blends_and_settles_to_drawn_or_not() {
+        let mut c = Canvas::with_cell(4, 2, (10, 20));
+        c.see_through();
+        assert!(c.rgba.chunks(4).all(|p| p[3] == 0));
+        c.disc(20.0, 20.0, 5.0, (200, 100, 0), 1.0);
+        let o = (20 * 40 + 20) * 4;
+        assert_eq!(&c.rgba[o..o + 4], &[200, 100, 0, 255], "the middle is solid");
+        let soft = c.rgba.chunks(4).filter(|p| p[3] > 0 && p[3] < 255).count();
+        assert!(soft > 0, "the edge is soft before settling");
+        c.line((0.0, 0.0), (39.0, 39.0), 1.0, (0, 0, 255), 0.5);
+        c.settle_alpha();
+        assert!(c.rgba.chunks(4).all(|p| p[3] == 0 || p[3] == 255), "settled");
+        assert!(c.rgba.chunks(4).filter(|p| p[3] == 255).count() > 60);
+    }
+
     #[test]
     fn a_canvas_is_whole_cells_with_holes_the_text_shows_through() {
         let mut c = Canvas::with_cell(4, 2, (10, 20));
