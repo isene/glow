@@ -2004,6 +2004,24 @@ impl Display {
     pub fn show_canvas(&mut self, canvas: &Canvas, x: u16, y: u16) -> bool {
         self.show_png(&canvas.png(), x, y, canvas.cols, canvas.rows)
     }
+
+    /// Show `canvas` in place of whatever this display showed before. The
+    /// new picture goes up first and the old ones come down after it, so
+    /// a redraw never shows a moment without a picture, which on a
+    /// running animation reads as flicker.
+    pub fn swap_canvas(&mut self, canvas: &Canvas, x: u16, y: u16) -> bool {
+        let old: Vec<u32> = std::mem::take(&mut self.active_ids);
+        let ok = self.show_canvas(canvas, x, y);
+        if matches!(self.protocol, Some(Protocol::Kitty)) && !old.is_empty() {
+            // Uppercase I: the placements and the image data go, so an
+            // animation does not fill the terminal with old frames.
+            for id in &old {
+                print!("\x1b_Ga=d,d=I,i={},q=2\x1b\\", id);
+            }
+            io::stdout().flush().ok();
+        }
+        ok
+    }
 }
 
 #[cfg(test)]
