@@ -1803,8 +1803,95 @@ fn get_terminal_pixel_size() -> (u32, u32, u32, u32) {
 
 
 
+// ── Canvas: a picture the size of a block of cells ──────────────────────
+
+/// A picture drawn pixel by pixel to fill `cols` × `rows` cells, shown
+/// with `Display::show_canvas`. It starts opaque black. Images sit over
+/// the text, so a cell that must show text gets a `hole`: transparent
+/// pixels that the text shows through.
+pub struct Canvas {
+    pub cols: u16,
+    pub rows: u16,
+    /// One cell in pixels.
+    pub cell: (u16, u16),
+    /// Width and height in pixels: whole cells, so the image is placed
+    /// without stretching.
+    pub w: usize,
+    pub h: usize,
+    /// RGBA, row by row.
+    pub rgba: Vec<u8>,
+}
+
+impl Canvas {
+    /// A canvas for `cols` × `rows` cells at the terminal's cell size.
+    pub fn new(cols: u16, rows: u16) -> Canvas {
+        Canvas::with_cell(cols, rows, get_cell_size())
+    }
+
+    /// The same with a given cell size, for tests or a size known already.
+    pub fn with_cell(cols: u16, rows: u16, cell: (u16, u16)) -> Canvas {
+        let cell = (cell.0.max(1), cell.1.max(1));
+        let (w, h) = (cols as usize * cell.0 as usize, rows as usize * cell.1 as usize);
+        Canvas { cols, rows, cell, w, h, rgba: [0, 0, 0, 255].repeat(w * h) }
+    }
+
+    /// Set one pixel, opaque. Off the canvas is ignored.
+    pub fn put(&mut self, x: usize, y: usize, rgb: (u8, u8, u8)) {
+        if x < self.w && y < self.h {
+            let o = (y * self.w + x) * 4;
+            self.rgba[o] = rgb.0;
+            self.rgba[o + 1] = rgb.1;
+            self.rgba[o + 2] = rgb.2;
+            self.rgba[o + 3] = 255;
+        }
+    }
+
+    /// Make `cells` cells from (`row`, `col`) transparent, so text printed
+    /// there shows through the picture.
+    pub fn hole(&mut self, row: usize, col: usize, cells: usize) {
+        let (cw, ch) = (self.cell.0 as usize, self.cell.1 as usize);
+        for y in row * ch..((row + 1) * ch).min(self.h) {
+            for x in col * cw..((col + cells) * cw).min(self.w) {
+                self.rgba[(y * self.w + x) * 4 + 3] = 0;
+            }
+        }
+    }
+
+    /// The canvas as a PNG, encoded for speed rather than size.
+    pub fn png(&self) -> Vec<u8> {
+        let mut png = Vec::new();
+        let enc = image::codecs::png::PngEncoder::new_with_quality(
+            &mut png, image::codecs::png::CompressionType::Fast, image::codecs::png::FilterType::Up);
+        let _ = image::ImageEncoder::write_image(enc, &self.rgba, self.w as u32, self.h as u32, image::ExtendedColorType::Rgba8);
+        png
+    }
+}
+
+impl Display {
+    /// Show `canvas` with its top-left cell at column `x`, row `y`, 1-based.
+    pub fn show_canvas(&mut self, canvas: &Canvas, x: u16, y: u16) -> bool {
+        self.show_png(&canvas.png(), x, y, canvas.cols, canvas.rows)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_canvas_is_whole_cells_with_holes_the_text_shows_through() {
+        let mut c = Canvas::with_cell(4, 2, (10, 20));
+        assert_eq!((c.w, c.h), (40, 40));
+        c.put(5, 5, (1, 2, 3));
+        c.hole(1, 2, 1);
+        let clear = c.rgba.chunks(4).filter(|p| p[3] == 0).count();
+        assert_eq!(clear, 200, "one cell of 10 by 20 is transparent");
+        assert_eq!(c.rgba[(25 * 40 + 25) * 4 + 3], 0);
+        assert_eq!(c.rgba[(25 * 40 + 15) * 4 + 3], 255);
+        let img = image::load_from_memory(&c.png()).unwrap().to_rgba8();
+        assert_eq!(img.dimensions(), (40, 40));
+        assert_eq!(img.get_pixel(5, 5).0, [1, 2, 3, 255]);
+        assert_eq!(img.get_pixel(25, 25).0[3], 0);
+    }
+
     #[test]
     fn a_png_from_memory_is_placed_and_cleared() {
         let mut png = Vec::new();
