@@ -1750,6 +1750,23 @@ pub fn terminal_size() -> (u16, u16) {
     }
 }
 
+/// The exact size in pixels of a block of `cols` × `rows` cells on this
+/// terminal, from the window's pixel size. A cell is often not a whole
+/// number of pixels wide, and a canvas built from a rounded cell size is
+/// stretched by the terminal to fit the cells; one built from this is not.
+pub fn cell_box(cols: u16, rows: u16) -> (usize, usize) {
+    if let Ok((trows, tcols)) = crossterm_size() {
+        let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+        let result = unsafe { libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) };
+        if result == 0 && ws.ws_xpixel > 0 && ws.ws_ypixel > 0 && tcols > 0 && trows > 0 {
+            let w = (cols as f64 * ws.ws_xpixel as f64 / tcols as f64).round() as usize;
+            let h = (rows as f64 * ws.ws_ypixel as f64 / trows as f64).round() as usize;
+            return (w.max(1), h.max(1));
+        }
+    }
+    (cols as usize * 10, rows as usize * 20)
+}
+
 pub fn get_cell_size() -> (u16, u16) {
     // Try to get pixel size from terminal
     if let Ok((rows, cols)) = crossterm_size() {
@@ -1812,7 +1829,9 @@ fn get_terminal_pixel_size() -> (u32, u32, u32, u32) {
 pub struct Canvas {
     pub cols: u16,
     pub rows: u16,
-    /// One cell in pixels.
+    /// One cell in whole pixels, rounded. A cell is often not a whole
+    /// number of pixels wide (1920 over 181 columns is 10.6), so geometry
+    /// should use `cell_w` and `cell_h`, which are exact.
     pub cell: (u16, u16),
     /// Width and height in pixels: whole cells, so the image is placed
     /// without stretching.
@@ -1823,9 +1842,15 @@ pub struct Canvas {
 }
 
 impl Canvas {
-    /// A canvas for `cols` × `rows` cells at the terminal's cell size.
+    /// A canvas for `cols` × `rows` cells of this terminal: exactly the
+    /// pixels that block covers, so the picture lands without stretching.
     pub fn new(cols: u16, rows: u16) -> Canvas {
-        Canvas::with_cell(cols, rows, get_cell_size())
+        let (w, h) = cell_box(cols, rows);
+        let cell = (
+            (w as f64 / cols.max(1) as f64).round().max(1.0) as u16,
+            (h as f64 / rows.max(1) as f64).round().max(1.0) as u16,
+        );
+        Canvas { cols, rows, cell, w, h, rgba: [0, 0, 0, 255].repeat(w * h) }
     }
 
     /// The same with a given cell size, for tests or a size known already.
@@ -1833,6 +1858,25 @@ impl Canvas {
         let cell = (cell.0.max(1), cell.1.max(1));
         let (w, h) = (cols as usize * cell.0 as usize, rows as usize * cell.1 as usize);
         Canvas { cols, rows, cell, w, h, rgba: [0, 0, 0, 255].repeat(w * h) }
+    }
+
+    /// `new` when `cell` is None, `with_cell` when it is given: one call
+    /// for code that runs on the terminal and in tests alike.
+    pub fn sized(cols: u16, rows: u16, cell: Option<(u16, u16)>) -> Canvas {
+        match cell {
+            Some(c) => Canvas::with_cell(cols, rows, c),
+            None => Canvas::new(cols, rows),
+        }
+    }
+
+    /// One cell's width in pixels, exact.
+    pub fn cell_w(&self) -> f64 {
+        self.w as f64 / self.cols.max(1) as f64
+    }
+
+    /// One cell's height in pixels, exact.
+    pub fn cell_h(&self) -> f64 {
+        self.h as f64 / self.rows.max(1) as f64
     }
 
     /// Set one pixel, opaque. Off the canvas is ignored.
@@ -1849,9 +1893,11 @@ impl Canvas {
     /// Make `cells` cells from (`row`, `col`) transparent, so text printed
     /// there shows through the picture.
     pub fn hole(&mut self, row: usize, col: usize, cells: usize) {
-        let (cw, ch) = (self.cell.0 as usize, self.cell.1 as usize);
-        for y in row * ch..((row + 1) * ch).min(self.h) {
-            for x in col * cw..((col + cells) * cw).min(self.w) {
+        let (cw, ch) = (self.cell_w(), self.cell_h());
+        let (y0, y1) = ((row as f64 * ch).round() as usize, ((row + 1) as f64 * ch).round() as usize);
+        let (x0, x1) = ((col as f64 * cw).round() as usize, ((col + cells) as f64 * cw).round() as usize);
+        for y in y0..y1.min(self.h) {
+            for x in x0..x1.min(self.w) {
                 self.rgba[(y * self.w + x) * 4 + 3] = 0;
             }
         }
@@ -1962,6 +2008,17 @@ impl Display {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn holes_follow_exact_cells_on_an_uneven_canvas() {
+        // 106 pixels over 10 columns: a cell is 10.6 wide.
+        let mut c = Canvas { cols: 10, rows: 2, cell: (11, 20), w: 106, h: 40, rgba: [0, 0, 0, 255].repeat(106 * 40) };
+        assert!((c.cell_w() - 10.6).abs() < 1e-9);
+        c.hole(1, 9, 1);
+        let clear: Vec<usize> = (0..106).filter(|&x| c.rgba[(30 * 106 + x) * 4 + 3] == 0).collect();
+        assert_eq!((clear[0], *clear.last().unwrap()), (95, 105), "the last cell runs from 95 to 105");
+        assert_eq!(c.rgba[(10 * 106 + 100) * 4 + 3], 255, "the row above is untouched");
+    }
+
     #[test]
     fn drawing_blends_and_settles_to_drawn_or_not() {
         let mut c = Canvas::with_cell(4, 2, (10, 20));
