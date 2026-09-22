@@ -11,8 +11,7 @@
 //!
 //! Nothing here runs unless the screen is a console with no X on it.
 
-use std::fs::{File, OpenOptions};
-use std::os::unix::fs::FileExt;
+use std::fs::OpenOptions;
 use std::path::Path;
 
 /// Ask the driver how the screen is laid out.
@@ -62,8 +61,14 @@ struct VarInfo {
 }
 
 /// The console screen, open and ready to be drawn on.
+///
+/// The pixels are mapped into this process, so putting a picture up is
+/// a memory copy and no system call at all. Reading them back is slow
+/// on most graphics chips, so nothing here reads: a pixel with nothing
+/// in its alpha is simply not written, and what was under it stays.
 pub struct Screen {
-    file: File,
+    map: *mut u8,
+    len: usize,
     /// The size of the screen in pixels.
     pub w: usize,
     pub h: usize,
@@ -81,10 +86,8 @@ impl Screen {
     pub fn open() -> Option<Screen> {
         let file = OpenOptions::new().read(true).write(true).open("/dev/fb0").ok()?;
         let mut var: VarInfo = unsafe { std::mem::zeroed() };
-        let asked = unsafe {
-            libc::ioctl(std::os::unix::io::AsRawFd::as_raw_fd(&file), FBIOGET_VSCREENINFO, &mut var)
-        };
-        if asked != 0 {
+        let fd = std::os::unix::io::AsRawFd::as_raw_fd(&file);
+        if unsafe { libc::ioctl(fd, FBIOGET_VSCREENINFO, &mut var) } != 0 {
             return None;
         }
         // Only the plain 32-bit screens, which is every laptop and every
@@ -93,8 +96,16 @@ impl Screen {
             return None;
         }
         let stride = read_number("stride").unwrap_or(var.xres_virtual as usize * 4);
+        let len = stride * var.yres_virtual.max(var.yres) as usize;
+        let map = unsafe {
+            libc::mmap(std::ptr::null_mut(), len, libc::PROT_WRITE | libc::PROT_READ, libc::MAP_SHARED, fd, 0)
+        };
+        if map == libc::MAP_FAILED {
+            return None;
+        }
         Some(Screen {
-            file,
+            map: map as *mut u8,
+            len,
             w: var.xres as usize,
             h: var.yres as usize,
             stride,
@@ -113,36 +124,31 @@ impl Screen {
         if w == 0 || h == 0 || rgba.len() < w * h * 4 {
             return false;
         }
-        let mut row = vec![0u8; self.stride];
         for line in 0..h {
             let sy = y + line as i64;
             if sy < 0 || sy as usize >= self.h {
                 continue;
             }
-            // Where this row starts and ends on the screen, cut to fit.
             let from = x.max(0) as usize;
             let to = ((x + w as i64).max(0) as usize).min(self.w);
             if from >= to {
                 continue;
             }
-            let bytes = (to - from) * self.bytes;
-            let at = sy as usize * self.stride + from * self.bytes;
-            // Read what is there, so a see-through pixel keeps it.
-            if self.file.read_exact_at(&mut row[..bytes], at as u64).is_err() {
-                continue;
-            }
-            for (i, sx) in (from..to).enumerate() {
+            let row = sy as usize * self.stride;
+            for sx in from..to {
                 let src = (line * w + (sx as i64 - x) as usize) * 4;
                 if rgba[src + 3] == 0 {
                     continue;
                 }
-                let px = i * self.bytes;
-                row[px + self.red] = rgba[src];
-                row[px + self.green] = rgba[src + 1];
-                row[px + self.blue] = rgba[src + 2];
-            }
-            if self.file.write_all_at(&row[..bytes], at as u64).is_err() {
-                return false;
+                let at = row + sx * self.bytes;
+                if at + self.bytes > self.len {
+                    break;
+                }
+                unsafe {
+                    *self.map.add(at + self.red) = rgba[src];
+                    *self.map.add(at + self.green) = rgba[src + 1];
+                    *self.map.add(at + self.blue) = rgba[src + 2];
+                }
             }
         }
         true
@@ -150,12 +156,6 @@ impl Screen {
 
     /// Paint a block of the screen one colour, for taking a picture away.
     pub fn fill(&self, x: i64, y: i64, w: usize, h: usize, rgb: (u8, u8, u8)) -> bool {
-        let mut one = vec![0u8; w.min(self.w) * self.bytes];
-        for px in one.chunks_exact_mut(self.bytes) {
-            px[self.red] = rgb.0;
-            px[self.green] = rgb.1;
-            px[self.blue] = rgb.2;
-        }
         for line in 0..h {
             let sy = y + line as i64;
             if sy < 0 || sy as usize >= self.h {
@@ -163,18 +163,33 @@ impl Screen {
             }
             let from = x.max(0) as usize;
             let to = ((x + w as i64).max(0) as usize).min(self.w);
-            if from >= to {
-                continue;
-            }
-            let bytes = (to - from) * self.bytes;
-            let at = sy as usize * self.stride + from * self.bytes;
-            if self.file.write_all_at(&one[..bytes.min(one.len())], at as u64).is_err() {
-                return false;
+            let row = sy as usize * self.stride;
+            for sx in from..to {
+                let at = row + sx * self.bytes;
+                if at + self.bytes > self.len {
+                    break;
+                }
+                unsafe {
+                    *self.map.add(at + self.red) = rgb.0;
+                    *self.map.add(at + self.green) = rgb.1;
+                    *self.map.add(at + self.blue) = rgb.2;
+                }
             }
         }
         true
     }
 }
+
+impl Drop for Screen {
+    fn drop(&mut self) {
+        unsafe {
+            libc::munmap(self.map as *mut libc::c_void, self.len);
+        }
+    }
+}
+
+// The pointer is only ever written through, one thread at a time.
+unsafe impl Send for Screen {}
 
 /// One number out of `/sys/class/graphics/fb0/`.
 fn read_number(what: &str) -> Option<usize> {
@@ -183,6 +198,19 @@ fn read_number(what: &str) -> Option<usize> {
         .trim()
         .parse()
         .ok()
+}
+
+/// How big the screen is, in pixels, read without opening anything.
+///
+/// A console does not tell the program its pixel size the way a
+/// terminal does, so this is where a cell size comes from there.
+pub fn screen_size() -> Option<(usize, usize)> {
+    if !there() {
+        return None;
+    }
+    let text = std::fs::read_to_string("/sys/class/graphics/fb0/virtual_size").ok()?;
+    let (w, h) = text.trim().split_once(',')?;
+    Some((w.parse().ok()?, h.parse().ok()?))
 }
 
 /// Is this a console whose screen we may draw on?
@@ -201,16 +229,29 @@ pub fn there() -> bool {
 
 #[cfg(test)]
 impl Screen {
-    /// A screen made of a plain file, for the tests: the same maths,
-    /// nothing wired to a display.
-    fn fake(file: File, w: usize, h: usize) -> Screen {
-        Screen { file, w, h, stride: w * 4, bytes: 4, red: 2, green: 1, blue: 0 }
+    /// A screen made of a plain file, for the tests: the same maths and
+    /// the same mapping, with no display behind it.
+    fn fake(file: &std::fs::File, w: usize, h: usize) -> Screen {
+        let len = w * h * 4;
+        let map = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_WRITE | libc::PROT_READ,
+                libc::MAP_SHARED,
+                std::os::unix::io::AsRawFd::as_raw_fd(file),
+                0,
+            )
+        };
+        assert_ne!(map, libc::MAP_FAILED, "the test screen could not be mapped");
+        Screen { map: map as *mut u8, len, w, h, stride: w * 4, bytes: 4, red: 2, green: 1, blue: 0 }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
     use std::io::Write;
 
     /// A blank screen of `w` by `h`, as a file we can read back.
@@ -219,7 +260,7 @@ mod tests {
         let mut f = File::create(&path).unwrap();
         f.write_all(&vec![7u8; w * h * 4]).unwrap();
         let file = OpenOptions::new().read(true).write(true).open(&path).unwrap();
-        (Screen::fake(file, w, h), path)
+        (Screen::fake(&file, w, h), path)
     }
 
     fn pixel(path: &std::path::Path, w: usize, x: usize, y: usize) -> [u8; 4] {
@@ -271,7 +312,7 @@ mod tests {
     fn taking_a_picture_away_paints_the_block_out() {
         let (s, path) = screen(4, 2);
         assert!(s.fill(0, 0, 2, 2, (0, 0, 0)));
-        assert_eq!(pixel(&path, 4, 0, 0), [0, 0, 0, 0]);
+        assert_eq!(pixel(&path, 4, 0, 0), [0, 0, 0, 7], "the three colours, and the spare byte left alone");
         assert_eq!(pixel(&path, 4, 2, 0), [7, 7, 7, 7], "only the block asked for");
         std::fs::remove_file(path).ok();
     }

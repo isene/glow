@@ -1816,6 +1816,14 @@ pub fn cell_box(cols: u16, rows: u16) -> (usize, usize) {
             let h = (rows as f64 * ws.ws_ypixel as f64 / trows as f64).round() as usize;
             return (w.max(1), h.max(1));
         }
+        // The same on a console, where the screen is the only source.
+        if let Some((sw, sh)) = fb::screen_size() {
+            if tcols > 0 && trows > 0 {
+                let w = cols as usize * sw / tcols as usize;
+                let h = rows as usize * sh / trows as usize;
+                return (w.max(1), h.max(1));
+            }
+        }
     }
     (cols as usize * 10, rows as usize * 20)
 }
@@ -1828,6 +1836,13 @@ pub fn get_cell_size() -> (u16, u16) {
         let result = unsafe { libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) };
         if result == 0 && ws.ws_xpixel > 0 && ws.ws_ypixel > 0 {
             return (ws.ws_xpixel / cols, ws.ws_ypixel / rows);
+        }
+        // A bare console reports no pixels at all. The screen itself
+        // knows how big it is, and the cells divide it evenly.
+        if let Some((w, h)) = fb::screen_size() {
+            if cols > 0 && rows > 0 {
+                return ((w / cols as usize) as u16, (h / rows as usize) as u16);
+            }
         }
     }
     // Default: 10x20
