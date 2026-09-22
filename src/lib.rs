@@ -11,6 +11,8 @@
 //! }
 //! ```
 
+pub mod fb;
+
 use base64::Engine;
 use std::collections::HashMap;
 use std::io::{self, Write};
@@ -20,6 +22,10 @@ use std::process::Command;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Protocol {
     Kitty,
+    /// The pixels of a bare console, written straight to `/dev/fb0`.
+    /// No terminal is involved: the picture goes on the screen itself,
+    /// and the console keeps drawing its text over the top.
+    Framebuffer,
     Sixel,
     W3m,
     Chafa,
@@ -352,6 +358,9 @@ fn seed_id() -> u32 {
 
 pub struct Display {
     protocol: Option<Protocol>,
+    /// Where the last picture went on a bare console, so it can be
+    /// taken away again: left, top, width, height, in pixels.
+    fb_shown: Option<(i64, i64, usize, usize)>,
     active_ids: Vec<u32>,
     image_cache: HashMap<String, (u32, u16, u16)>,  // (image_id, natural_pixel_w, natural_pixel_h)
     pub png_cache: PngCache,
@@ -373,6 +382,7 @@ impl Display {
         let protocol = detect_protocol();
         Self {
             protocol,
+            fb_shown: None,
             active_ids: Vec::new(),
             image_cache: HashMap::new(),
             png_cache: new_png_cache(),
@@ -407,6 +417,7 @@ impl Display {
         };
         Self {
             protocol,
+            fb_shown: None,
             active_ids: Vec::new(),
             image_cache: HashMap::new(),
             png_cache: new_png_cache(),
@@ -454,6 +465,7 @@ impl Display {
             Protocol::HalfBlock => half_block_display(image_path, x, y, max_width, max_height),
             Protocol::Braille => braille_display(image_path, x, y, max_width, max_height),
             Protocol::Ascii => ascii_display(image_path, x, y, max_width, max_height),
+            Protocol::Framebuffer => fb_display(image_path, x, y, max_width, max_height),
         }
     }
 
@@ -496,6 +508,10 @@ impl Display {
     /// when replacing an earlier picture, so the terminal can free it.
     pub fn show_png(&mut self, png: &[u8], x: u16, y: u16, width: u16, height: u16) -> bool {
         let Some(proto) = self.protocol else { return false };
+        if proto == Protocol::Framebuffer {
+            let Ok(picture) = image::load_from_memory(png) else { return false };
+            return self.fb_put(&picture.to_rgba8(), x, y);
+        }
         if proto != Protocol::Kitty {
             self.next_id = self.next_id.wrapping_add(1);
             let path = std::env::temp_dir()
@@ -566,6 +582,10 @@ impl Display {
             print!("\x1b_Ga=d,d=a,q=2\x1b\\");
             io::stdout().flush().ok();
         }
+        if let (Some((px, py, w, h)), Some(screen)) = (self.fb_shown, fb::Screen::open()) {
+            screen.fill(px, py, w, h, (0, 0, 0));
+            self.fb_shown = None;
+        }
         self.active_ids.clear();
     }
 
@@ -594,6 +614,14 @@ impl Display {
             }
             Some(Protocol::Ascii) => {
                 // ASCII is text-based, cleared by terminal redraw
+            }
+            Some(Protocol::Framebuffer) => {
+                // Nothing redraws the console's pixels but us, so the
+                // picture is painted out where it stood.
+                if let (Some((px, py, w, h)), Some(screen)) = (self.fb_shown, fb::Screen::open()) {
+                    screen.fill(px, py, w, h, (0, 0, 0));
+                }
+                self.fb_shown = None;
             }
             None => {}
         }
@@ -1158,6 +1186,13 @@ fn detect_protocol() -> Option<Protocol> {
         if command_exists("xwininfo") && command_exists("xdotool") && command_exists("identify") {
             return Some(Protocol::W3m);
         }
+    }
+
+    // A bare console has no protocol at all, but it has the screen.
+    // Real pixels beat any arrangement of characters, so this comes
+    // before the text fallbacks and after everything a terminal offers.
+    if !has_display && fb::there() {
+        return Some(Protocol::Framebuffer);
     }
 
     // Text fallbacks, in order of how good they look.
@@ -1738,6 +1773,24 @@ pub fn kitty_frame_rgb(id: u32, width: u32, height: u32, cols: u16, rows: u16, r
     out
 }
 
+/// Put a picture on a bare console, sized to the box of cells it was
+/// asked for and placed where that box begins.
+fn fb_display(image_path: &str, x: u16, y: u16, max_width: u16, max_height: u16) -> bool {
+    let Some(screen) = fb::Screen::open() else { return false };
+    let Ok(picture) = image::open(image_path) else { return false };
+    let (bw, bh) = cell_box(max_width, max_height);
+    let fitted = picture.resize(bw as u32, bh as u32, image::imageops::FilterType::Triangle);
+    let rgba = fitted.to_rgba8();
+    let (px, py) = cell_to_pixel(x, y);
+    screen.blit(px, py, rgba.width() as usize, rgba.height() as usize, rgba.as_raw())
+}
+
+/// The pixel a cell starts at. Cells count from one, pixels from zero.
+fn cell_to_pixel(x: u16, y: u16) -> (i64, i64) {
+    let (cw, ch) = get_cell_size();
+    ((x.saturating_sub(1) as i64) * cw as i64, (y.saturating_sub(1) as i64) * ch as i64)
+}
+
 /// Delete image `id` and its placements.
 pub fn kitty_forget(id: u32) -> String {
     format!("\x1b_Ga=d,d=i,i={},q=2\x1b\\", id)
@@ -2000,8 +2053,29 @@ impl Canvas {
 }
 
 impl Display {
+    /// Lay already-made pixels on a bare console at a cell position.
+    fn fb_put(&mut self, rgba: &image::RgbaImage, x: u16, y: u16) -> bool {
+        let Some(screen) = fb::Screen::open() else { return false };
+        let (px, py) = cell_to_pixel(x, y);
+        self.fb_shown = Some((px, py, rgba.width() as usize, rgba.height() as usize));
+        screen.blit(px, py, rgba.width() as usize, rgba.height() as usize, rgba.as_raw())
+    }
+
+    /// The same, for a canvas the caller drew.
+    fn fb_canvas(&mut self, canvas: &Canvas, x: u16, y: u16) -> bool {
+        let Some(screen) = fb::Screen::open() else { return false };
+        let (px, py) = cell_to_pixel(x, y);
+        self.fb_shown = Some((px, py, canvas.w, canvas.h));
+        screen.blit(px, py, canvas.w, canvas.h, &canvas.rgba)
+    }
+
     /// Show `canvas` with its top-left cell at column `x`, row `y`, 1-based.
     pub fn show_canvas(&mut self, canvas: &Canvas, x: u16, y: u16) -> bool {
+        // On a console the pixels are already in the shape the screen
+        // wants, so they go straight there: no PNG made, none decoded.
+        if self.protocol == Some(Protocol::Framebuffer) {
+            return self.fb_canvas(canvas, x, y);
+        }
         self.show_png(&canvas.png(), x, y, canvas.cols, canvas.rows)
     }
 

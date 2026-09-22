@@ -10,6 +10,16 @@ Used by [pointer](https://github.com/isene/pointer) for file preview images.
 
 <br clear="left"/>
 
+## A bare console
+
+With no X running, the Linux console has no graphics protocol at all. It does have the screen: `/dev/fb0`, the pixels themselves.
+
+glow writes there directly, so a picture on a console is real pixels, not blocks of text. Nothing else in an app changes.
+
+- It needs 32-bit colour and membership of the `video` group, which is the ordinary setup.
+- It never draws while X or Wayland owns the screen.
+- The console goes on drawing its text over the top. A canvas with holes in it, as `hole` makes, lets that text through.
+
 ## Quick Start
 
 ```toml
