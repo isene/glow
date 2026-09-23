@@ -17,6 +17,22 @@ use std::path::Path;
 /// Ask the driver how the screen is laid out.
 const FBIOGET_VSCREENINFO: libc::c_ulong = 0x4600;
 
+/// The screen to draw on. `GLOW_FB` puts a plain file in its place,
+/// which is the only way to try this path while X holds the real one:
+/// `GLOW_FB=/tmp/fake GLOW_FB_SIZE=1920x1200`.
+fn device() -> String {
+    std::env::var("GLOW_FB").unwrap_or_else(|_| "/dev/fb0".to_string())
+}
+
+/// The size to believe for a stand-in screen.
+fn pretend_size() -> (u32, u32) {
+    let text = std::env::var("GLOW_FB_SIZE").unwrap_or_default();
+    match text.split_once('x') {
+        Some((w, h)) => (w.parse().unwrap_or(1920), h.parse().unwrap_or(1200)),
+        None => (1920, 1200),
+    }
+}
+
 /// Where one colour sits inside a pixel, in bits.
 #[repr(C)]
 #[derive(Default, Clone, Copy)]
@@ -74,6 +90,10 @@ pub struct Screen {
     pub h: usize,
     /// Bytes from the start of one row to the start of the next.
     stride: usize,
+    /// Where the visible screen begins inside the buffer. A console
+    /// that scrolls by panning moves this, and pixels written without
+    /// it land off the edge of what anyone can see.
+    start: usize,
     /// Bytes per pixel, and which byte holds which colour.
     bytes: usize,
     red: usize,
@@ -84,18 +104,34 @@ pub struct Screen {
 impl Screen {
     /// Open the screen, or give back nothing when there is none to open.
     pub fn open() -> Option<Screen> {
-        let file = OpenOptions::new().read(true).write(true).open("/dev/fb0").ok()?;
+        let file = OpenOptions::new().read(true).write(true).open(device()).ok()?;
         let mut var: VarInfo = unsafe { std::mem::zeroed() };
         let fd = std::os::unix::io::AsRawFd::as_raw_fd(&file);
         if unsafe { libc::ioctl(fd, FBIOGET_VSCREENINFO, &mut var) } != 0 {
-            return None;
+            // A stand-in screen answers no such question, so it is told.
+            if std::env::var_os("GLOW_FB").is_none() {
+                return None;
+            }
+            let (w, h) = pretend_size();
+            var.xres = w;
+            var.yres = h;
+            var.xres_virtual = w;
+            var.yres_virtual = h;
+            var.bits_per_pixel = 32;
+            var.red.offset = 16;
+            var.green.offset = 8;
+            var.blue.offset = 0;
         }
         // Only the plain 32-bit screens, which is every laptop and every
         // desktop this century. Anything else keeps the text fallback.
         if var.bits_per_pixel != 32 {
             return None;
         }
-        let stride = read_number("stride").unwrap_or(var.xres_virtual as usize * 4);
+        let stride = if std::env::var_os("GLOW_FB").is_some() {
+            var.xres_virtual as usize * 4
+        } else {
+            read_number("stride").unwrap_or(var.xres_virtual as usize * 4)
+        };
         let len = stride * var.yres_virtual.max(var.yres) as usize;
         let map = unsafe {
             libc::mmap(std::ptr::null_mut(), len, libc::PROT_WRITE | libc::PROT_READ, libc::MAP_SHARED, fd, 0)
@@ -106,6 +142,7 @@ impl Screen {
         Some(Screen {
             map: map as *mut u8,
             len,
+            start: var.yoffset as usize * stride + var.xoffset as usize * 4,
             w: var.xres as usize,
             h: var.yres as usize,
             stride,
@@ -134,7 +171,7 @@ impl Screen {
             if from >= to {
                 continue;
             }
-            let row = sy as usize * self.stride;
+            let row = self.start + sy as usize * self.stride;
             for sx in from..to {
                 let src = (line * w + (sx as i64 - x) as usize) * 4;
                 if rgba[src + 3] == 0 {
@@ -163,7 +200,7 @@ impl Screen {
             }
             let from = x.max(0) as usize;
             let to = ((x + w as i64).max(0) as usize).min(self.w);
-            let row = sy as usize * self.stride;
+            let row = self.start + sy as usize * self.stride;
             for sx in from..to {
                 let at = row + sx * self.bytes;
                 if at + self.bytes > self.len {
@@ -208,6 +245,10 @@ pub fn screen_size() -> Option<(usize, usize)> {
     if !there() {
         return None;
     }
+    if std::env::var_os("GLOW_FB").is_some() {
+        let (w, h) = pretend_size();
+        return Some((w as usize, h as usize));
+    }
     let text = std::fs::read_to_string("/sys/class/graphics/fb0/virtual_size").ok()?;
     let (w, h) = text.trim().split_once(',')?;
     Some((w.parse().ok()?, h.parse().ok()?))
@@ -221,10 +262,10 @@ pub fn there() -> bool {
     if std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some() {
         return false;
     }
-    if !Path::new("/dev/fb0").exists() {
+    if !Path::new(&device()).exists() {
         return false;
     }
-    OpenOptions::new().read(true).write(true).open("/dev/fb0").is_ok()
+    OpenOptions::new().read(true).write(true).open(device()).is_ok()
 }
 
 #[cfg(test)]
@@ -244,7 +285,7 @@ impl Screen {
             )
         };
         assert_ne!(map, libc::MAP_FAILED, "the test screen could not be mapped");
-        Screen { map: map as *mut u8, len, w, h, stride: w * 4, bytes: 4, red: 2, green: 1, blue: 0 }
+        Screen { map: map as *mut u8, len, w, h, stride: w * 4, start: 0, bytes: 4, red: 2, green: 1, blue: 0 }
     }
 }
 
