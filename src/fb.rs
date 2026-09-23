@@ -188,7 +188,29 @@ impl Screen {
                 }
             }
         }
+        self.flush(y, h);
         true
+    }
+
+    /// Tell the driver the rows from `y` for `h` have changed.
+    ///
+    /// A modern console does not hand out the screen itself. It hands
+    /// out a copy, and copies it over when it is told. Without this the
+    /// writing lands in memory nobody looks at, which is a black screen
+    /// with a game running behind it.
+    fn flush(&self, y: i64, h: usize) {
+        let page = 4096;
+        let top = self.start + y.max(0) as usize * self.stride;
+        let bottom = (top + h * self.stride).min(self.len);
+        if bottom <= top {
+            return;
+        }
+        let from = top / page * page;
+        let to = bottom.div_ceil(page) * page;
+        let to = to.min(self.len);
+        unsafe {
+            libc::msync(self.map.add(from) as *mut libc::c_void, to - from, libc::MS_SYNC);
+        }
     }
 
     /// Paint a block of the screen one colour, for taking a picture away.
@@ -213,6 +235,7 @@ impl Screen {
                 }
             }
         }
+        self.flush(y, h);
         true
     }
 }

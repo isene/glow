@@ -361,6 +361,9 @@ pub struct Display {
     /// Where the last picture went on a bare console, so it can be
     /// taken away again: left, top, width, height, in pixels.
     fb_shown: Option<(i64, i64, usize, usize)>,
+    /// The console screen, opened once and kept. Opening it again for
+    /// every frame would cost an ioctl and a mapping each time.
+    fb: Option<fb::Screen>,
     active_ids: Vec<u32>,
     image_cache: HashMap<String, (u32, u16, u16)>,  // (image_id, natural_pixel_w, natural_pixel_h)
     pub png_cache: PngCache,
@@ -383,6 +386,7 @@ impl Display {
         Self {
             protocol,
             fb_shown: None,
+            fb: None,
             active_ids: Vec::new(),
             image_cache: HashMap::new(),
             png_cache: new_png_cache(),
@@ -418,6 +422,7 @@ impl Display {
         Self {
             protocol,
             fb_shown: None,
+            fb: None,
             active_ids: Vec::new(),
             image_cache: HashMap::new(),
             png_cache: new_png_cache(),
@@ -582,8 +587,10 @@ impl Display {
             print!("\x1b_Ga=d,d=a,q=2\x1b\\");
             io::stdout().flush().ok();
         }
-        if let (Some((px, py, w, h)), Some(screen)) = (self.fb_shown, fb::Screen::open()) {
-            screen.fill(px, py, w, h, (0, 0, 0));
+        if let Some((px, py, w, h)) = self.fb_shown {
+            if let Some(screen) = self.fb_screen() {
+                screen.fill(px, py, w, h, (0, 0, 0));
+            }
             self.fb_shown = None;
         }
         self.active_ids.clear();
@@ -618,8 +625,10 @@ impl Display {
             Some(Protocol::Framebuffer) => {
                 // Nothing redraws the console's pixels but us, so the
                 // picture is painted out where it stood.
-                if let (Some((px, py, w, h)), Some(screen)) = (self.fb_shown, fb::Screen::open()) {
-                    screen.fill(px, py, w, h, (0, 0, 0));
+                if let Some((px, py, w, h)) = self.fb_shown {
+                    if let Some(screen) = self.fb_screen() {
+                        screen.fill(px, py, w, h, (0, 0, 0));
+                    }
                 }
                 self.fb_shown = None;
             }
@@ -2068,20 +2077,35 @@ impl Canvas {
 }
 
 impl Display {
+    /// The console screen, opened the first time it is wanted.
+    fn fb_screen(&mut self) -> Option<&fb::Screen> {
+        if self.fb.is_none() {
+            self.fb = fb::Screen::open();
+        }
+        self.fb.as_ref()
+    }
+
     /// Lay already-made pixels on a bare console at a cell position.
     fn fb_put(&mut self, rgba: &image::RgbaImage, x: u16, y: u16) -> bool {
-        let Some(screen) = fb::Screen::open() else { return false };
         let (px, py) = cell_to_pixel(x, y);
-        self.fb_shown = Some((px, py, rgba.width() as usize, rgba.height() as usize));
-        screen.blit(px, py, rgba.width() as usize, rgba.height() as usize, rgba.as_raw())
+        let (w, h) = (rgba.width() as usize, rgba.height() as usize);
+        self.fb_shown = Some((px, py, w, h));
+        let raw = rgba.as_raw();
+        match self.fb_screen() {
+            Some(screen) => screen.blit(px, py, w, h, raw),
+            None => false,
+        }
     }
 
     /// The same, for a canvas the caller drew.
     fn fb_canvas(&mut self, canvas: &Canvas, x: u16, y: u16) -> bool {
-        let Some(screen) = fb::Screen::open() else { return false };
         let (px, py) = cell_to_pixel(x, y);
         self.fb_shown = Some((px, py, canvas.w, canvas.h));
-        screen.blit(px, py, canvas.w, canvas.h, &canvas.rgba)
+        let (w, h) = (canvas.w, canvas.h);
+        match self.fb_screen() {
+            Some(screen) => screen.blit(px, py, w, h, &canvas.rgba),
+            None => false,
+        }
     }
 
     /// Show `canvas` with its top-left cell at column `x`, row `y`, 1-based.
