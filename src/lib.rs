@@ -1785,7 +1785,7 @@ pub fn kitty_frame_rgb(id: u32, width: u32, height: u32, cols: u16, rows: u16, r
 /// Put a picture on a bare console, sized to the box of cells it was
 /// asked for and placed where that box begins.
 fn fb_display(image_path: &str, x: u16, y: u16, max_width: u16, max_height: u16) -> bool {
-    let Some(screen) = fb::Screen::open() else { return false };
+    let Some(mut screen) = fb::Screen::open() else { return false };
     let Ok(picture) = image::open(image_path) else { return false };
     let (bw, bh) = cell_box(max_width, max_height);
     let fitted = picture.resize(bw as u32, bh as u32, image::imageops::FilterType::Triangle);
@@ -2078,11 +2078,11 @@ impl Canvas {
 
 impl Display {
     /// The console screen, opened the first time it is wanted.
-    fn fb_screen(&mut self) -> Option<&fb::Screen> {
+    fn fb_screen(&mut self) -> Option<&mut fb::Screen> {
         if self.fb.is_none() {
             self.fb = fb::Screen::open();
         }
-        self.fb.as_ref()
+        self.fb.as_mut()
     }
 
     /// Lay already-made pixels on a bare console at a cell position.

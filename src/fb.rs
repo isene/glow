@@ -16,6 +16,9 @@ use std::path::Path;
 
 /// Ask the driver how the screen is laid out.
 const FBIOGET_VSCREENINFO: libc::c_ulong = 0x4600;
+/// Tell the driver to show the buffer again. On a console that keeps a
+/// copy of the screen, this is what copies the writing over.
+const FBIOPAN_DISPLAY: libc::c_ulong = 0x4606;
 
 /// The screen to draw on. `GLOW_FB` puts a plain file in its place,
 /// which is the only way to try this path while X holds the real one:
@@ -44,6 +47,7 @@ struct Bitfield {
 
 /// The kernel's `fb_var_screeninfo`, field for field.
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct VarInfo {
     xres: u32,
     yres: u32,
@@ -83,6 +87,15 @@ struct VarInfo {
 /// on most graphics chips, so nothing here reads: a pixel with nothing
 /// in its alpha is simply not written, and what was under it stays.
 pub struct Screen {
+    /// The open device. It is kept because the driver has to be told to
+    /// show what was written, and that goes by the file.
+    file: std::fs::File,
+    /// How the screen is laid out, as the driver described it. Handing
+    /// it back unchanged is how the driver is asked to show the buffer.
+    var: VarInfo,
+    /// Whether that ask works here. Where it does not, the mapping is
+    /// laid down and taken up again, which every driver honours.
+    pan_works: bool,
     map: *mut u8,
     len: usize,
     /// The size of the screen in pixels.
@@ -140,6 +153,9 @@ impl Screen {
             return None;
         }
         Some(Screen {
+            file,
+            var,
+            pan_works: true,
             map: map as *mut u8,
             len,
             start: var.yoffset as usize * stride + var.xoffset as usize * 4,
@@ -157,7 +173,7 @@ impl Screen {
     ///
     /// `rgba` is four bytes a pixel. A pixel with nothing in its alpha
     /// is left as it was, which is how a canvas leaves holes for text.
-    pub fn blit(&self, x: i64, y: i64, w: usize, h: usize, rgba: &[u8]) -> bool {
+    pub fn blit(&mut self, x: i64, y: i64, w: usize, h: usize, rgba: &[u8]) -> bool {
         if w == 0 || h == 0 || rgba.len() < w * h * 4 {
             return false;
         }
@@ -192,13 +208,47 @@ impl Screen {
         true
     }
 
+    /// What the screen is made of, for working out why a picture does
+    /// not show: its size, how far a row is, where the visible part
+    /// begins, and how much is mapped.
+    pub fn about(&self) -> String {
+        format!(
+            "{}x{} pixels, row {} bytes, visible from {}, mapped {} bytes, colours at {},{},{}",
+            self.w, self.h, self.stride, self.start, self.len, self.red, self.green, self.blue
+        )
+    }
+
+    /// What is on the screen at one point, read back. For finding out
+    /// whether a picture reached the screen or only the program's idea
+    /// of it.
+    pub fn peek(&self, x: usize, y: usize) -> (u8, u8, u8) {
+        let at = self.start + y * self.stride + x * self.bytes;
+        if at + self.bytes > self.len {
+            return (0, 0, 0);
+        }
+        unsafe {
+            (
+                *self.map.add(at + self.red),
+                *self.map.add(at + self.green),
+                *self.map.add(at + self.blue),
+            )
+        }
+    }
+
     /// Tell the driver the rows from `y` for `h` have changed.
     ///
     /// A modern console does not hand out the screen itself. It hands
     /// out a copy, and copies it over when it is told. Without this the
     /// writing lands in memory nobody looks at, which is a black screen
     /// with a game running behind it.
-    fn flush(&self, y: i64, h: usize) {
+    /// Put what has been written on the screen.
+    ///
+    /// A console keeps a copy of the screen and shows it when it is
+    /// told. Writing alone leaves the picture in memory nobody
+    /// displays, which reads as a black screen with a game running
+    /// behind it. Three words are tried, cheapest first, and the one
+    /// this driver answers to is the one that is kept.
+    fn flush(&mut self, y: i64, h: usize) {
         let page = 4096;
         let top = self.start + y.max(0) as usize * self.stride;
         let bottom = (top + h * self.stride).min(self.len);
@@ -206,15 +256,46 @@ impl Screen {
             return;
         }
         let from = top / page * page;
-        let to = bottom.div_ceil(page) * page;
-        let to = to.min(self.len);
+        let to = bottom.div_ceil(page).min(self.len.div_ceil(page)) * page;
+        let fd = std::os::unix::io::AsRawFd::as_raw_fd(&self.file);
         unsafe {
             libc::msync(self.map.add(from) as *mut libc::c_void, to - from, libc::MS_SYNC);
+            libc::fsync(fd);
+            if self.pan_works {
+                let mut var = self.var;
+                if libc::ioctl(fd, FBIOPAN_DISPLAY, &mut var) != 0 {
+                    self.pan_works = false;
+                }
+            }
+        }
+        // And the one every driver honours: the mapping goes down and
+        // comes up again. Measured at well under a millisecond, and it
+        // is the only word that has ever put a picture on this console.
+        self.remap();
+    }
+
+    /// Lay the mapping down and take it up again. Slower than a word to
+    /// the driver, and the one thing every driver shows.
+    fn remap(&mut self) {
+        let fd = std::os::unix::io::AsRawFd::as_raw_fd(&self.file);
+        unsafe {
+            libc::munmap(self.map as *mut libc::c_void, self.len);
+            let again = libc::mmap(
+                std::ptr::null_mut(),
+                self.len,
+                libc::PROT_WRITE | libc::PROT_READ,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            );
+            if again != libc::MAP_FAILED {
+                self.map = again as *mut u8;
+            }
         }
     }
 
     /// Paint a block of the screen one colour, for taking a picture away.
-    pub fn fill(&self, x: i64, y: i64, w: usize, h: usize, rgb: (u8, u8, u8)) -> bool {
+    pub fn fill(&mut self, x: i64, y: i64, w: usize, h: usize, rgb: (u8, u8, u8)) -> bool {
         for line in 0..h {
             let sy = y + line as i64;
             if sy < 0 || sy as usize >= self.h {
@@ -295,7 +376,7 @@ pub fn there() -> bool {
 impl Screen {
     /// A screen made of a plain file, for the tests: the same maths and
     /// the same mapping, with no display behind it.
-    fn fake(file: &std::fs::File, w: usize, h: usize) -> Screen {
+    fn fake(file: std::fs::File, w: usize, h: usize) -> Screen {
         let len = w * h * 4;
         let map = unsafe {
             libc::mmap(
@@ -303,12 +384,13 @@ impl Screen {
                 len,
                 libc::PROT_WRITE | libc::PROT_READ,
                 libc::MAP_SHARED,
-                std::os::unix::io::AsRawFd::as_raw_fd(file),
+                std::os::unix::io::AsRawFd::as_raw_fd(&file),
                 0,
             )
         };
         assert_ne!(map, libc::MAP_FAILED, "the test screen could not be mapped");
-        Screen { map: map as *mut u8, len, w, h, stride: w * 4, start: 0, bytes: 4, red: 2, green: 1, blue: 0 }
+        let var: VarInfo = unsafe { std::mem::zeroed() };
+        Screen { file, var, pan_works: false, map: map as *mut u8, len, w, h, stride: w * 4, start: 0, bytes: 4, red: 2, green: 1, blue: 0 }
     }
 }
 
@@ -324,7 +406,7 @@ mod tests {
         let mut f = File::create(&path).unwrap();
         f.write_all(&vec![7u8; w * h * 4]).unwrap();
         let file = OpenOptions::new().read(true).write(true).open(&path).unwrap();
-        (Screen::fake(&file, w, h), path)
+        (Screen::fake(file, w, h), path)
     }
 
     fn pixel(path: &std::path::Path, w: usize, x: usize, y: usize) -> [u8; 4] {
@@ -342,7 +424,7 @@ mod tests {
 
     #[test]
     fn a_picture_lands_where_it_was_put_in_the_screen_s_own_byte_order() {
-        let (s, path) = screen(8, 4);
+        let (mut s, path) = screen(8, 4);
         // One red pixel, at the second column of the second row.
         let red = vec![220u8, 30, 10, 255];
         assert!(s.blit(1, 1, 1, 1, &red));
@@ -353,7 +435,7 @@ mod tests {
 
     #[test]
     fn a_see_through_pixel_keeps_what_was_under_it() {
-        let (s, path) = screen(4, 2);
+        let (mut s, path) = screen(4, 2);
         let two = vec![1u8, 2, 3, 0, 9, 8, 7, 255];
         assert!(s.blit(0, 0, 2, 1, &two));
         assert_eq!(pixel(&path, 4, 0, 0), [7, 7, 7, 7], "nothing in its alpha, so nothing written");
@@ -363,7 +445,7 @@ mod tests {
 
     #[test]
     fn a_picture_hanging_over_the_edge_is_cut_to_fit() {
-        let (s, path) = screen(4, 2);
+        let (mut s, path) = screen(4, 2);
         let row = vec![100u8, 100, 100, 255].repeat(4);
         // Two of the four pixels are past the right edge.
         assert!(s.blit(2, 0, 4, 1, &row));
@@ -374,7 +456,7 @@ mod tests {
 
     #[test]
     fn taking_a_picture_away_paints_the_block_out() {
-        let (s, path) = screen(4, 2);
+        let (mut s, path) = screen(4, 2);
         assert!(s.fill(0, 0, 2, 2, (0, 0, 0)));
         assert_eq!(pixel(&path, 4, 0, 0), [0, 0, 0, 7], "the three colours, and the spare byte left alone");
         assert_eq!(pixel(&path, 4, 2, 0), [7, 7, 7, 7], "only the block asked for");
@@ -386,7 +468,7 @@ mod tests {
         // A game frame the size of a laptop screen, written the way a
         // console game writes it. The file stands in for the display.
         let (w, h) = (1920usize, 1200usize);
-        let (s, path) = screen(w, h);
+        let (mut s, path) = screen(w, h);
         let frame = vec![90u8; w * h * 4];
         let began = std::time::Instant::now();
         for _ in 0..5 {
