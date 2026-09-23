@@ -443,6 +443,16 @@ impl Display {
     }
 
     /// Check if image display is supported
+    /// Does a picture stay put when the text around it is redrawn?
+    ///
+    /// Kitty holds a picture itself, so an app may repaint its text and
+    /// leave the picture alone. A console has one screen for both, and
+    /// a repainted cell is a painted-over picture. An app that draws
+    /// text over a picture has to draw the picture again there.
+    pub fn keeps_pictures(&self) -> bool {
+        matches!(self.protocol, Some(Protocol::Kitty))
+    }
+
     pub fn supported(&self) -> bool {
         self.protocol.is_some()
     }
