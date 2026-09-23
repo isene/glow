@@ -318,6 +318,22 @@ mod tests {
     }
 
     #[test]
+    fn a_full_screen_frame_is_quick_enough_for_a_game() {
+        // A game frame the size of a laptop screen, written the way a
+        // console game writes it. The file stands in for the display.
+        let (w, h) = (1920usize, 1200usize);
+        let (s, path) = screen(w, h);
+        let frame = vec![90u8; w * h * 4];
+        let began = std::time::Instant::now();
+        for _ in 0..5 {
+            s.blit(0, 0, w, h, &frame);
+        }
+        let each = began.elapsed().as_secs_f64() / 5.0 * 1000.0;
+        println!("a 1920x1200 frame takes {each:.1} ms into memory");
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
     fn a_display_rules_out_the_console() {
         if std::env::var_os("DISPLAY").is_some() {
             assert!(!there(), "X owns the screen, so the framebuffer is not ours");
