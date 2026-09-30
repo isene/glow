@@ -1,6 +1,6 @@
 [package]
 name = "fe2o3-glow"
-version = "0.1.42"
+version = "0.1.43"
 edition = "2021"
 authors = ["Geir Isene <g@isene.com>"]
 description = "Terminal image display via kitty/sixel/w3m/braille protocols. Feature clone of termpix."
@@ -14,10 +14,13 @@ name = "glow"
 
 [dependencies]
 base64 = "0.22"
-libc = "0.2"
 # Rust-native image decoding + resize + re-encode. Replaces the
 # `convert` (ImageMagick) subprocess fork on the hot path. Default
 # features cover PNG / JPEG / GIF / WebP / BMP — enough for every
 # attachment kastrup actually shows.
 image = { version = "0.25", default-features = false,
           features = ["png", "jpeg", "gif", "webp", "bmp", "tiff"] }
+
+# In a web page (wasm32-wasip1) there is no kernel terminal and no framebuffer.
+[target.'cfg(not(target_os = "wasi"))'.dependencies]
+libc = "0.2"

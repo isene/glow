@@ -11,7 +11,23 @@
 //! }
 //! ```
 
+#[cfg(not(target_os = "wasi"))]
 pub mod fb;
+
+/// A web page has no framebuffer: the same calls, and never a screen.
+#[cfg(target_os = "wasi")]
+pub mod fb {
+    pub struct Screen;
+    impl Screen {
+        pub fn open() -> Option<Screen> { None }
+        pub fn blit(&mut self, _x: i64, _y: i64, _w: usize, _h: usize, _rgba: &[u8]) -> bool { false }
+        pub fn about(&self) -> String { String::new() }
+        pub fn peek(&self, _x: usize, _y: usize) -> (u8, u8, u8) { (0, 0, 0) }
+        pub fn fill(&mut self, _x: i64, _y: i64, _w: usize, _h: usize, _rgb: (u8, u8, u8)) -> bool { false }
+    }
+    pub fn screen_size() -> Option<(usize, usize)> { None }
+    pub fn there() -> bool { false }
+}
 
 use base64::Engine;
 use std::collections::HashMap;
@@ -526,6 +542,11 @@ impl Display {
         if proto == Protocol::Framebuffer {
             let Ok(picture) = image::load_from_memory(png) else { return false };
             return self.fb_put(&picture.to_rgba8(), x, y);
+        }
+        if matches!(proto, Protocol::HalfBlock | Protocol::Braille) {
+            let Ok(picture) = image::load_from_memory(png) else { return false };
+            let picture = picture.to_rgba8();
+            return text_pixels(proto, picture.as_raw(), picture.width(), picture.height(), x, y, width, height);
         }
         if proto != Protocol::Kitty {
             self.next_id = self.next_id.wrapping_add(1);
@@ -1425,6 +1446,24 @@ fn luma(r: u8, g: u8, b: u8) -> u8 {
 /// since a cell is about twice as tall as it is wide, both come out
 /// square. It is the best a terminal can do without a graphics protocol,
 /// and it needs no external program at all.
+/// Half blocks or braille from pixels in memory, shrunk to fit `cols` ×
+/// `rows` cells at (`x`, `y`): no file, no fork. A web page, which has no
+/// files, draws every picture this way.
+#[allow(clippy::too_many_arguments)]
+fn text_pixels(proto: Protocol, rgba: &[u8], sw: u32, sh: u32, x: u16, y: u16, cols: u16, rows: u16) -> bool {
+    if sw == 0 || sh == 0 || cols == 0 || rows == 0 || rgba.len() < (sw * sh * 4) as usize {
+        return false;
+    }
+    let (kx, ky) = if proto == Protocol::HalfBlock { (1, 2) } else { (2, 4) };
+    let (tw, th) = fit_within(sw, sh, cols as u32 * kx, rows as u32 * ky);
+    let px = box_average(rgba, sw, sh, tw, th);
+    let out = if proto == Protocol::HalfBlock { half_block_frame(tw, th, &px, x, y) } else { braille_frame(tw, th, &px, x, y) };
+    let mut o = io::stdout();
+    let _ = o.write_all(out.as_bytes());
+    let _ = o.flush();
+    true
+}
+
 fn half_block_display(path: &str, x: u16, y: u16, max_width: u16, max_height: u16) -> bool {
     let (w, h, px) = match pixel_grid(path, max_width as u32, max_height as u32 * 2) {
         Some(g) => g,
@@ -1827,12 +1866,10 @@ pub fn terminal_size() -> (u16, u16) {
 /// number of pixels wide, and a canvas built from a rounded cell size is
 /// stretched by the terminal to fit the cells; one built from this is not.
 pub fn cell_box(cols: u16, rows: u16) -> (usize, usize) {
-    if let Ok((trows, tcols)) = crossterm_size() {
-        let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-        let result = unsafe { libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) };
-        if result == 0 && ws.ws_xpixel > 0 && ws.ws_ypixel > 0 && tcols > 0 && trows > 0 {
-            let w = (cols as f64 * ws.ws_xpixel as f64 / tcols as f64).round() as usize;
-            let h = (rows as f64 * ws.ws_ypixel as f64 / trows as f64).round() as usize;
+    if let Some((trows, tcols, xpix, ypix)) = winsize() {
+        if xpix > 0 && ypix > 0 {
+            let w = (cols as f64 * xpix as f64 / tcols as f64).round() as usize;
+            let h = (rows as f64 * ypix as f64 / trows as f64).round() as usize;
             return (w.max(1), h.max(1));
         }
         // The same on a console, where the screen is the only source.
@@ -1849,12 +1886,9 @@ pub fn cell_box(cols: u16, rows: u16) -> (usize, usize) {
 
 pub fn get_cell_size() -> (u16, u16) {
     // Try to get pixel size from terminal
-    if let Ok((rows, cols)) = crossterm_size() {
-        // Try ioctl for pixel dimensions
-        let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-        let result = unsafe { libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) };
-        if result == 0 && ws.ws_xpixel > 0 && ws.ws_ypixel > 0 {
-            return (ws.ws_xpixel / cols, ws.ws_ypixel / rows);
+    if let Some((rows, cols, xpix, ypix)) = winsize() {
+        if xpix > 0 && ypix > 0 {
+            return (xpix / cols, ypix / rows);
         }
         // A bare console reports no pixels at all. The screen itself
         // knows how big it is, and the cells divide it evenly.
@@ -1869,14 +1903,23 @@ pub fn get_cell_size() -> (u16, u16) {
 }
 
 fn crossterm_size() -> Result<(u16, u16), ()> {
-    // rows, cols via ioctl
+    winsize().map(|(r, c, _, _)| (r, c)).ok_or(())
+}
+
+/// The terminal's rows, columns and pixel width and height, as the kernel
+/// has them; the pixels are 0 where the terminal does not say. None
+/// without a terminal, or with no rows or columns.
+#[cfg(not(target_os = "wasi"))]
+fn winsize() -> Option<(u16, u16, u16, u16)> {
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
     let result = unsafe { libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) };
-    if result == 0 && ws.ws_row > 0 && ws.ws_col > 0 {
-        Ok((ws.ws_row, ws.ws_col))
-    } else {
-        Err(())
-    }
+    (result == 0 && ws.ws_row > 0 && ws.ws_col > 0).then_some((ws.ws_row, ws.ws_col, ws.ws_xpixel, ws.ws_ypixel))
+}
+
+/// A web page has no kernel terminal; the callers fall back to 10 by 20.
+#[cfg(target_os = "wasi")]
+fn winsize() -> Option<(u16, u16, u16, u16)> {
+    None
 }
 
 fn get_terminal_pixel_size() -> (u32, u32, u32, u32) {
@@ -2125,6 +2168,10 @@ impl Display {
         if self.protocol == Some(Protocol::Framebuffer) {
             return self.fb_canvas(canvas, x, y);
         }
+        // Half blocks and braille are made right here from the pixels.
+        if let Some(p @ (Protocol::HalfBlock | Protocol::Braille)) = self.protocol {
+            return text_pixels(p, &canvas.rgba, canvas.w as u32, canvas.h as u32, x, y, canvas.cols, canvas.rows);
+        }
         self.show_png(&canvas.png(), x, y, canvas.cols, canvas.rows)
     }
 
@@ -2149,6 +2196,25 @@ impl Display {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_canvas_draws_the_same_straight_as_through_a_png_file() {
+        // Half blocks and braille used to take a canvas through a PNG in a
+        // temporary file; now they take its pixels. The cells must match.
+        let mut c = super::Canvas::with_cell(7, 3, (10, 20));
+        for (i, p) in c.rgba.chunks_mut(4).enumerate() {
+            p.copy_from_slice(&[(i * 7) as u8, (i * 13) as u8, (i * 29) as u8, if i % 11 == 0 { 0 } else { 255 }]);
+        }
+        let path = std::env::temp_dir().join(format!("glow-same-{}.png", std::process::id()));
+        std::fs::write(&path, c.png()).unwrap();
+        for (kx, ky) in [(1u32, 2u32), (2, 4)] {
+            let (bw, bh) = (c.cols as u32 * kx, c.rows as u32 * ky);
+            let through_file = super::pixel_grid(path.to_str().unwrap(), bw, bh).unwrap();
+            let (tw, th) = super::fit_within(c.w as u32, c.h as u32, bw, bh);
+            assert_eq!(through_file, (tw, th, super::box_average(&c.rgba, c.w as u32, c.h as u32, tw, th)));
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn holes_follow_exact_cells_on_an_uneven_canvas() {
         // 106 pixels over 10 columns: a cell is 10.6 wide.
