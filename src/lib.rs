@@ -61,6 +61,11 @@ pub enum Protocol {
     /// (`TERM=linux`) has no braille block (`U+2800`) in its font, so
     /// Braille renders blank there; ASCII always shows. `convert` only.
     Ascii,
+    /// iTerm2's inline images: the PNG itself in an `OSC 1337` sequence,
+    /// stretched over whole cells. xterm.js's image addon reads these, so
+    /// a crust app in a web page shows real pixels this way (the page
+    /// says so in FE2O3_IMAGES). Never chosen outside a web page.
+    Iip,
 }
 
 /// Pre-converted PNG data cache, shareable across threads.
@@ -478,7 +483,7 @@ impl Display {
     /// picture too, at two or eight dots a cell, and a chart of fine
     /// points reads better drawn for those dots directly.
     pub fn real_pixels(&self) -> bool {
-        matches!(self.protocol, Some(Protocol::Kitty | Protocol::Framebuffer | Protocol::Sixel | Protocol::W3m))
+        matches!(self.protocol, Some(Protocol::Kitty | Protocol::Framebuffer | Protocol::Sixel | Protocol::W3m | Protocol::Iip))
     }
 
     /// Get the detected protocol
@@ -505,6 +510,7 @@ impl Display {
             Protocol::Braille => braille_display(image_path, x, y, max_width, max_height),
             Protocol::Ascii => ascii_display(image_path, x, y, max_width, max_height),
             Protocol::Framebuffer => fb_display(image_path, x, y, max_width, max_height),
+            Protocol::Iip => std::fs::read(image_path).map(|png| iip_png(&png, x, y, max_width, max_height)).unwrap_or(false),
         }
     }
 
@@ -555,6 +561,9 @@ impl Display {
             let Ok(picture) = image::load_from_memory(png) else { return false };
             let picture = picture.to_rgba8();
             return text_pixels(proto, picture.as_raw(), picture.width(), picture.height(), x, y, width, height);
+        }
+        if proto == Protocol::Iip {
+            return iip_png(png, x, y, width, height);
         }
         if proto != Protocol::Kitty {
             self.next_id = self.next_id.wrapping_add(1);
@@ -646,8 +655,8 @@ impl Display {
                 }
                 self.active_ids.clear();
             }
-            Some(Protocol::Sixel) => {
-                // Sixel images are inline, cleared by terminal redraw
+            Some(Protocol::Sixel) | Some(Protocol::Iip) => {
+                // Inline images, cleared by the terminal's own redraw
             }
             Some(Protocol::W3m) => {
                 w3m_clear(x, y, width, height, term_width, term_height);
@@ -1205,6 +1214,12 @@ fn chafa_display(image_path: &str, x: u16, y: u16, max_width: u16, max_height: u
 // --- Protocol detection ---
 
 fn detect_protocol() -> Option<Protocol> {
+    // A web page whose terminal shows iTerm2's inline images says so.
+    #[cfg(target_os = "wasi")]
+    if std::env::var("FE2O3_IMAGES").as_deref() == Ok("iip") {
+        return Some(Protocol::Iip);
+    }
+
     // Kitty
     if std::env::var("TERM").unwrap_or_default() == "xterm-kitty"
         || std::env::var("KITTY_WINDOW_ID").is_ok()
@@ -1889,7 +1904,8 @@ pub fn cell_box(cols: u16, rows: u16) -> (usize, usize) {
             }
         }
     }
-    (cols as usize * 10, rows as usize * 20)
+    let (cw, ch) = fallback_cell();
+    (cols as usize * cw as usize, rows as usize * ch as usize)
 }
 
 pub fn get_cell_size() -> (u16, u16) {
@@ -1906,8 +1922,39 @@ pub fn get_cell_size() -> (u16, u16) {
             }
         }
     }
-    // Default: 10x20
+    fallback_cell()
+}
+
+/// A cell's size in pixels when the terminal does not say: 10 by 20, or
+/// in a web page what the page reports in FE2O3_CELL_PX ("9 18").
+fn fallback_cell() -> (u16, u16) {
+    #[cfg(target_os = "wasi")]
+    if let Some((w, h)) = std::env::var("FE2O3_CELL_PX").ok().and_then(|v| {
+        let mut it = v.split_whitespace().filter_map(|n| n.parse::<u16>().ok());
+        Some((it.next()?, it.next()?))
+    }) {
+        if w > 0 && h > 0 { return (w, h); }
+    }
     (10, 20)
+}
+
+/// A PNG as an iTerm2 inline image at cell (`x`, `y`), over as many whole
+/// cells as its pixels fill, at most `width` × `height`. The cursor stays
+/// on the picture's last row, so one at the bottom does not scroll.
+fn iip_png(png: &[u8], x: u16, y: u16, width: u16, height: u16) -> bool {
+    let (cell_w, cell_h) = get_cell_size();
+    let (Some(w), Some(h)) = (png_width(png), png_height(png)) else { return false };
+    if cell_w == 0 || cell_h == 0 || width == 0 || height == 0 { return false; }
+    let cols = w.div_ceil(cell_w as u32).clamp(1, width as u32);
+    let rows = h.div_ceil(cell_h as u32).clamp(1, height as u32);
+    let mut out = format!("\x1b[{};{}H\x1b]1337;File=inline=1;size={};width={};height={};preserveAspectRatio=0:",
+        y, x, png.len(), cols, rows);
+    base64::engine::general_purpose::STANDARD.encode_string(png, &mut out);
+    out.push('\x07');
+    let mut o = io::stdout();
+    let _ = o.write_all(out.as_bytes());
+    let _ = o.flush();
+    true
 }
 
 fn crossterm_size() -> Result<(u16, u16), ()> {
