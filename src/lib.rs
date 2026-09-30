@@ -473,6 +473,14 @@ impl Display {
         self.protocol.is_some()
     }
 
+    /// Can this terminal show a picture pixel for pixel: kitty, sixel,
+    /// w3m or the console's framebuffer? Half blocks and braille show a
+    /// picture too, at two or eight dots a cell, and a chart of fine
+    /// points reads better drawn for those dots directly.
+    pub fn real_pixels(&self) -> bool {
+        matches!(self.protocol, Some(Protocol::Kitty | Protocol::Framebuffer | Protocol::Sixel | Protocol::W3m))
+    }
+
     /// Get the detected protocol
     pub fn protocol(&self) -> Option<Protocol> {
         self.protocol
