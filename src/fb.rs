@@ -14,11 +14,14 @@
 use std::fs::OpenOptions;
 use std::path::Path;
 
+// The ioctl calls below cast these with `as _`: the request is an unsigned
+// long in glibc and on macOS, and an int in musl.
+
 /// Ask the driver how the screen is laid out.
-const FBIOGET_VSCREENINFO: libc::Ioctl = 0x4600;
+const FBIOGET_VSCREENINFO: libc::c_ulong = 0x4600;
 /// Tell the driver to show the buffer again. On a console that keeps a
 /// copy of the screen, this is what copies the writing over.
-const FBIOPAN_DISPLAY: libc::Ioctl = 0x4606;
+const FBIOPAN_DISPLAY: libc::c_ulong = 0x4606;
 
 /// The screen to draw on. `GLOW_FB` puts a plain file in its place,
 /// which is the only way to try this path while X holds the real one:
@@ -120,7 +123,7 @@ impl Screen {
         let file = OpenOptions::new().read(true).write(true).open(device()).ok()?;
         let mut var: VarInfo = unsafe { std::mem::zeroed() };
         let fd = std::os::unix::io::AsRawFd::as_raw_fd(&file);
-        if unsafe { libc::ioctl(fd, FBIOGET_VSCREENINFO, &mut var) } != 0 {
+        if unsafe { libc::ioctl(fd, FBIOGET_VSCREENINFO as _, &mut var) } != 0 {
             // A stand-in screen answers no such question, so it is told.
             if std::env::var_os("GLOW_FB").is_none() {
                 return None;
@@ -263,7 +266,7 @@ impl Screen {
             libc::fsync(fd);
             if self.pan_works {
                 let mut var = self.var;
-                if libc::ioctl(fd, FBIOPAN_DISPLAY, &mut var) != 0 {
+                if libc::ioctl(fd, FBIOPAN_DISPLAY as _, &mut var) != 0 {
                     self.pan_works = false;
                 }
             }
