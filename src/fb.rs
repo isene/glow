@@ -15,10 +15,10 @@ use std::fs::OpenOptions;
 use std::path::Path;
 
 /// Ask the driver how the screen is laid out.
-const FBIOGET_VSCREENINFO: libc::c_ulong = 0x4600;
+const FBIOGET_VSCREENINFO: libc::Ioctl = 0x4600;
 /// Tell the driver to show the buffer again. On a console that keeps a
 /// copy of the screen, this is what copies the writing over.
-const FBIOPAN_DISPLAY: libc::c_ulong = 0x4606;
+const FBIOPAN_DISPLAY: libc::Ioctl = 0x4606;
 
 /// The screen to draw on. `GLOW_FB` puts a plain file in its place,
 /// which is the only way to try this path while X holds the real one:
