@@ -1908,6 +1908,40 @@ pub fn cell_box(cols: u16, rows: u16) -> (usize, usize) {
     (cols as usize * cw as usize, rows as usize * ch as usize)
 }
 
+/// The cells a picture fills when [`Display::show_clipped`] shows it in
+/// a box of `max_cols` × `max_rows` cells: its shape kept, turned upright,
+/// never enlarged, rounded up to whole cells. Reads the start of the file
+/// alone, so an editor can leave room for a picture before it shows it.
+/// `None` for a file that is no picture this crate reads by itself.
+pub fn fit_cells(image_path: &str, max_cols: u16, max_rows: u16) -> Option<(u16, u16)> {
+    let (w, h) = upright_size(image_path)?;
+    fit_cells_of(w, h, max_cols, max_rows, get_cell_size())
+}
+
+/// A picture's size in pixels as it stands once a camera's note on how
+/// to turn it is followed.
+fn upright_size(image_path: &str) -> Option<(u32, u32)> {
+    use image::metadata::Orientation::*;
+    use image::ImageDecoder;
+    let mut decoder = image::ImageReader::open(image_path).ok()?
+        .with_guessed_format().ok()?
+        .into_decoder().ok()?;
+    let (w, h) = decoder.dimensions();
+    let on_its_side = matches!(
+        decoder.orientation().unwrap_or(NoTransforms),
+        Rotate90 | Rotate270 | Rotate90FlipH | Rotate270FlipH
+    );
+    Some(if on_its_side { (h, w) } else { (w, h) })
+}
+
+fn fit_cells_of(w: u32, h: u32, max_cols: u16, max_rows: u16, cell: (u16, u16)) -> Option<(u16, u16)> {
+    let (cw, ch) = (cell.0 as u32, cell.1 as u32);
+    if w == 0 || h == 0 || cw == 0 || ch == 0 || max_cols == 0 || max_rows == 0 { return None; }
+    let (box_w, box_h) = (max_cols as u32 * cw, max_rows as u32 * ch);
+    let (fw, fh) = if w <= box_w && h <= box_h { (w, h) } else { fit_within(w, h, box_w, box_h) };
+    Some((fw.div_ceil(cw) as u16, fh.div_ceil(ch) as u16))
+}
+
 pub fn get_cell_size() -> (u16, u16) {
     // Try to get pixel size from terminal
     if let Some((rows, cols, xpix, ypix)) = winsize() {
@@ -2379,6 +2413,47 @@ mod tests {
         assert_eq!(out[3], 127);
         let clear = box_average(&[9, 9, 9, 0, 9, 9, 9, 0], 2, 1, 1, 1);
         assert_eq!(clear[3], 0);
+    }
+
+    #[test]
+    fn a_picture_takes_whole_cells_and_is_never_enlarged() {
+        // A 4000 × 3000 photo in 80 × 20 cells of 10 × 20: the height rules.
+        assert_eq!(fit_cells_of(4000, 3000, 80, 20, (10, 20)), Some((54, 20)));
+        // A wide strip: the width rules, and half a row rounds up.
+        assert_eq!(fit_cells_of(1600, 60, 80, 20, (10, 20)), Some((80, 2)));
+        // A small icon keeps its size.
+        assert_eq!(fit_cells_of(32, 32, 80, 20, (10, 20)), Some((4, 2)));
+        assert_eq!(fit_cells_of(32, 32, 0, 20, (10, 20)), None);
+        assert_eq!(fit_cells_of(32, 32, 80, 20, (0, 0)), None);
+    }
+
+    #[test]
+    fn a_photo_on_its_side_is_measured_upright() {
+        // A 40 × 20 JPEG with the camera's note "turn me a quarter".
+        let dir = std::env::temp_dir().join(format!("glow-fit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let plain = dir.join("plain.png");
+        image::RgbImage::new(40, 20).save(&plain).unwrap();
+        assert_eq!(upright_size(plain.to_str().unwrap()), Some((40, 20)));
+        assert_eq!(upright_size(dir.join("none.png").to_str().unwrap()), None);
+        let text = dir.join("note.md");
+        std::fs::write(&text, "no picture").unwrap();
+        assert_eq!(upright_size(text.to_str().unwrap()), None);
+        // The same picture as a JPEG, with the note written in after the
+        // two bytes that open the file: tag 0x0112, value 6.
+        let mut jpeg = Vec::new();
+        image::RgbImage::new(40, 20)
+            .write_to(&mut std::io::Cursor::new(&mut jpeg), image::ImageFormat::Jpeg).unwrap();
+        let mut note: Vec<u8> = b"Exif\0\0II*\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0\x06\0\0\0\0\0\0\0".to_vec();
+        let mut turned = jpeg[..2].to_vec();
+        turned.extend([0xff, 0xe1]);
+        turned.extend(((note.len() + 2) as u16).to_be_bytes());
+        turned.append(&mut note);
+        turned.extend(&jpeg[2..]);
+        let side = dir.join("side.jpg");
+        std::fs::write(&side, turned).unwrap();
+        assert_eq!(upright_size(side.to_str().unwrap()), Some((20, 40)));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

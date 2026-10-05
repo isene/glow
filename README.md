@@ -123,6 +123,9 @@ impl Display {
         term_width: u16, term_height: u16   // Terminal size
     );
 }
+
+// The cells a picture will fill in a box, from the start of the file alone
+pub fn fit_cells(image_path: &str, max_cols: u16, max_rows: u16) -> Option<(u16, u16)>;
 ```
 
 ## How It Works
