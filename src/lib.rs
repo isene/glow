@@ -136,6 +136,28 @@ fn cache_contains(cache: &PngCache, key: &str) -> bool {
     disk_cache_path(key).map(|p| p.exists()).unwrap_or(false)
 }
 
+/// Drop the pictures made from older versions of `image_path`, in RAM
+/// and on disk. Their keys hold the old mtime, so nothing can hit them
+/// again; without this a file rewritten every two seconds (beam's live
+/// thumbnail) leaves a PNG on disk for each version.
+fn drop_stale(index: &mut HashMap<String, (u32, u16, u16)>, png: &PngCache,
+              image_path: &str, mtime: u64) {
+    let prefix = format!("{}:", image_path);
+    let now = mtime.to_string();
+    let stale = |k: &str| k.strip_prefix(&prefix)
+        .and_then(|rest| rest.split(':').nth(1))
+        .is_some_and(|m| m != now);
+    index.retain(|k, _| !stale(k));
+    let Ok(mut c) = png.lock() else { return };
+    let old: Vec<String> = c.keys().filter(|k| stale(k)).cloned().collect();
+    for k in old {
+        c.remove(&k);
+        if let Some(p) = disk_cache_path(&k) {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
 /// Two-tier cache put: write to disk first (so a crash before the
 /// next get still leaves the bytes available), then insert into RAM.
 /// Caps RAM at 256 entries — disk has no soft cap (the user's image
@@ -715,6 +737,7 @@ impl Display {
         // earlier non-clipped sizes) — otherwise they ride the DEC
         // scroll region as ghosts.
         self.forget_path(image_path);
+        drop_stale(&mut self.image_cache, &self.png_cache, image_path, mtime);
         let id = self.allocate_id();
         // Two-tier lookup: RAM, then on-disk PNG cache. Falls through
         // to `convert` only when neither tier has the resized PNG.
@@ -877,6 +900,7 @@ impl Display {
             // delete below is a no-op for those stale ids and they keep
             // riding the DEC scroll region as ghost duplicates.
             self.forget_path(image_path);
+            drop_stale(&mut self.image_cache, &self.png_cache, image_path, mtime);
             let id = self.allocate_id();
 
             // Two-tier cache: in-RAM first, fall back to the on-disk
@@ -2285,6 +2309,24 @@ impl Display {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_changed_file_keeps_one_picture_not_one_per_version() {
+        let png = super::new_png_cache();
+        let mut index = std::collections::HashMap::new();
+        for key in ["/t/a.ppm:340x210:100", "/t/a.ppm:340x210:102", "/t/a.ppm:680x420:102",
+                    "/t/b.ppm:340x210:100", "/t/a.svg:340x210:100:rsvg"] {
+            png.lock().unwrap().insert(key.to_string(), vec![0]);
+            index.insert(key.to_string(), (1, 1, 1));
+        }
+        super::drop_stale(&mut index, &png, "/t/a.ppm", 102);
+        super::drop_stale(&mut index, &png, "/t/a.svg", 100);
+        let mut left: Vec<String> = png.lock().unwrap().keys().cloned().collect();
+        left.sort();
+        assert_eq!(left, ["/t/a.ppm:340x210:102", "/t/a.ppm:680x420:102",
+                          "/t/a.svg:340x210:100:rsvg", "/t/b.ppm:340x210:100"]);
+        assert_eq!(index.len(), 4);
+    }
+
     #[test]
     fn a_canvas_draws_the_same_straight_as_through_a_png_file() {
         // Half blocks and braille used to take a canvas through a PNG in a
