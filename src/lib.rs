@@ -2149,9 +2149,8 @@ impl Canvas {
     /// Make the whole canvas see-through, for a picture that only paints
     /// what is there and leaves the terminal's background elsewhere.
     pub fn see_through(&mut self) {
-        for px in self.rgba.chunks_mut(4) {
-            px[3] = 0;
-        }
+        // The colour under a clear pixel never shows, so it goes too.
+        self.rgba.fill(0);
     }
 
     /// Paint `rgb` over one pixel with cover `a` (0 to 1), source over
@@ -2304,6 +2303,24 @@ impl Display {
             io::stdout().flush().ok();
         }
         ok
+    }
+
+    /// Take the picture down and free its data, as `swap_canvas` frees
+    /// the one it replaces. `clear_all` keeps the data, for a picture that
+    /// comes back; a canvas is made new each time, so its data would pile up.
+    pub fn drop_canvas(&mut self) {
+        let old: Vec<u32> = std::mem::take(&mut self.active_ids);
+        if matches!(self.protocol, Some(Protocol::Kitty)) && !old.is_empty() {
+            for id in &old {
+                print!("\x1b_Ga=d,d=I,i={},q=2\x1b\\", id);
+            }
+            io::stdout().flush().ok();
+        }
+        if let Some((px, py, w, h)) = self.fb_shown.take() {
+            if let Some(screen) = self.fb_screen() {
+                screen.fill(px, py, w, h, (0, 0, 0));
+            }
+        }
     }
 }
 
